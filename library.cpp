@@ -31,21 +31,8 @@ struct PlayGoState {
     ScePlayGoToDo todo[SCE_PLAYGO_CHUNK_INDEX_MAX];
 };
 
-static PlayGoState g_playgo = {
-    0,
-    0,
-    1,
-    SCE_PLAYGO_INSTALL_SPEED_FULL,
-    SCE_PLAYGO_LANGUAGE_MASK_ALL,
-    0,
-    0,
-    100,
-    0,
-    {0},
-    {0},
-    0,
-    {{0}}
-};
+static PlayGoState g_playgo;
+static char g_config_line[kConfigLineSize];
 
 #if PLAYGO_ENABLE_LOGGING
 static void pg_log_reset(void) {
@@ -246,7 +233,7 @@ static void pg_set_defaults(void) {
  */
 static void pg_load_config(void) {
     FILE* fp;
-    char line[kConfigLineSize];
+    char* line = g_config_line;
     unsigned long value;
     uint32_t chunkCount;
     int parsedChunkConfig = 0;
