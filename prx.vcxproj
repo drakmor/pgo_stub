@@ -1,0 +1,180 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|Prospero">
+      <Configuration>Debug</Configuration>
+      <Platform>Prospero</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|Prospero">
+      <Configuration>Release</Configuration>
+      <Platform>Prospero</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="ReleaseLog|Prospero">
+      <Configuration>ReleaseLog</Configuration>
+      <Platform>Prospero</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="ReleaseNoLog|Prospero">
+      <Configuration>ReleaseNoLog</Configuration>
+      <Platform>Prospero</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{488B8427-711B-4185-8F85-985FF8725CB0}</ProjectGuid>
+    <ProjectName>libScePlayGo</ProjectName>
+    <ProsperoSdkVersion>2.000</ProsperoSdkVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Prospero'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Prospero'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseLog|Prospero'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseNoLog|Prospero'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|Prospero'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|Prospero'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="('$(Configuration)'=='ReleaseLog' Or '$(Configuration)'=='ReleaseNoLog') And '$(Platform)'=='Prospero'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Prospero'">
+    <TargetExt>.prx</TargetExt>
+    <PostBuildEventUseInBuild>false</PostBuildEventUseInBuild>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|Prospero'">
+    <TargetExt>.prx</TargetExt>
+    <OutDir>.\out</OutDir>
+    <PostBuildEventUseInBuild>false</PostBuildEventUseInBuild>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseLog|Prospero'">
+    <PlayGoVariantDir>log</PlayGoVariantDir>
+    <PlayGoEnableLogging>1</PlayGoEnableLogging>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseNoLog|Prospero'">
+    <PlayGoVariantDir>nolog</PlayGoVariantDir>
+    <PlayGoEnableLogging>0</PlayGoEnableLogging>
+  </PropertyGroup>
+  <PropertyGroup Condition="('$(Configuration)'=='ReleaseLog' Or '$(Configuration)'=='ReleaseNoLog') And '$(Platform)'=='Prospero'">
+    <TargetExt>.prx</TargetExt>
+    <OutDir>$(ProjectDir)out\$(PlayGoVariantDir)\</OutDir>
+    <IntDir>$(ProjectDir)Prospero_$(Configuration)\</IntDir>
+    <PostBuildEventUseInBuild>false</PostBuildEventUseInBuild>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Prospero'">
+    <ClCompile>
+      <PreprocessorDefinitions>_DEBUG;%(PreprocessorDefinitions);</PreprocessorDefinitions>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalOptions>-fPIC -fno-stack-protector %(AdditionalOptions)</AdditionalOptions>
+      <CppLanguageStd>Cpp20</CppLanguageStd>
+      <CLanguageStd>C17</CLanguageStd>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>libkernel_stub_weak.a;$(OutDir)libSceLibcInternal_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>-Wl,--as-needed %(AdditionalOptions)</AdditionalOptions>
+      <ImportLibrary>libScePlayGo.prx</ImportLibrary>
+      <DataStripping>true</DataStripping>
+      <InfoStripping>StripSymsAndDebug</InfoStripping>
+    </Link>
+    <PostBuildEvent>
+      <Command>if not exist "$(ProjectDir)\sce_module" mkdir "$(ProjectDir)\sce_module"
+if exist "$(ProjectDir)\libSceLibcInternal.sprx" copy /Y "$(ProjectDir)\libSceLibcInternal.sprx" "$(ProjectDir)\sce_module\"
+      </Command>
+    </PostBuildEvent>
+    <ProjectReference>
+      <UseLibraryDependencyInputs>true</UseLibraryDependencyInputs>
+    </ProjectReference>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|Prospero'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;%(PreprocessorDefinitions);</PreprocessorDefinitions>
+      <OptimizationLevel>Level2</OptimizationLevel>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalOptions>-fPIC -fno-stack-protector %(AdditionalOptions)</AdditionalOptions>
+      <CppLanguageStd>Cpp20</CppLanguageStd>
+      <CLanguageStd>C17</CLanguageStd>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>libkernel_stub_weak.a;$(OutDir)libSceLibcInternal_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>-Wl,--as-needed %(AdditionalOptions)</AdditionalOptions>
+      <ImportLibrary>libScePlayGo.prx</ImportLibrary>
+      <DataStripping>true</DataStripping>
+      <InfoStripping>StripSymsAndDebug</InfoStripping>
+    </Link>
+    <PostBuildEvent>
+      <Command>if not exist "$(ProjectDir)\sce_module" mkdir "$(ProjectDir)\sce_module"
+if exist "$(ProjectDir)\libSceLibcInternal.sprx" copy /Y "$(ProjectDir)\libSceLibcInternal.sprx" "$(ProjectDir)\sce_module\"
+      </Command>
+    </PostBuildEvent>
+    <ProjectReference>
+      <UseLibraryDependencyInputs>true</UseLibraryDependencyInputs>
+    </ProjectReference>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="('$(Configuration)'=='ReleaseLog' Or '$(Configuration)'=='ReleaseNoLog') And '$(Platform)'=='Prospero'">
+    <ClCompile>
+      <PreprocessorDefinitions>NDEBUG;PLAYGO_ENABLE_LOGGING=$(PlayGoEnableLogging);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <OptimizationLevel>Level2</OptimizationLevel>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <AdditionalOptions>-fPIC -fno-stack-protector %(AdditionalOptions)</AdditionalOptions>
+      <CppLanguageStd>Cpp20</CppLanguageStd>
+      <CLanguageStd>C17</CLanguageStd>
+    </ClCompile>
+    <Link>
+      <AdditionalDependencies>libkernel_stub_weak.a;$(OutDir)libSceLibcInternal_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalOptions>-Wl,--as-needed %(AdditionalOptions)</AdditionalOptions>
+      <ImportLibrary>libScePlayGo.prx</ImportLibrary>
+      <DataStripping>true</DataStripping>
+      <InfoStripping>StripSymsAndDebug</InfoStripping>
+    </Link>
+    <ProjectReference>
+      <UseLibraryDependencyInputs>true</UseLibraryDependencyInputs>
+    </ProjectReference>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="library.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="library.h" />
+  </ItemGroup>
+  <Target Name="GeneratePlayGoLibcInternalStub"
+          BeforeTargets="Link"
+          Inputs="$(ProjectDir)tools\make_playgo_libc_internal_stub.py"
+          Outputs="$(OutDir)libSceLibcInternal_stub_weak.a">
+    <Message Importance="High" Text="Generating $(OutDir)libSceLibcInternal_stub_weak.a" />
+    <Exec WorkingDirectory="$(ProjectDir)"
+          Command="python &quot;$(ProjectDir)tools\make_playgo_libc_internal_stub.py&quot; --out &quot;$(OutDir)libSceLibcInternal_stub_weak.a&quot;" />
+    <ItemGroup>
+      <FileWrites Include="$(OutDir)libSceLibcInternal_stub_weak.a" />
+    </ItemGroup>
+  </Target>
+  <Target Name="GenerateSignedPlayGoSprx"
+          AfterTargets="Build"
+          Condition="'$(Configuration)'=='ReleaseLog' Or '$(Configuration)'=='ReleaseNoLog'"
+          Inputs="$(TargetPath);$(ProjectDir)tools\make_fself.py"
+          Outputs="$(OutDir)$(TargetName).sprx">
+    <Message Importance="High" Text="Generating signed $(OutDir)$(TargetName).sprx from $(TargetPath)" />
+    <Exec WorkingDirectory="$(ProjectDir)"
+          Command="python &quot;$(ProjectDir)tools\make_fself.py&quot; &quot;$(TargetPath)&quot; &quot;$(OutDir)$(TargetName).sprx&quot;" />
+  </Target>
+  <Target Name="CleanSignedPlayGoSprx"
+          BeforeTargets="Clean"
+          Condition="'$(Configuration)'=='ReleaseLog' Or '$(Configuration)'=='ReleaseNoLog'">
+    <Delete Files="$(OutDir)$(TargetName).sprx" />
+  </Target>
+  <Import Condition="'$(ConfigurationType)' == 'Makefile' and Exists('$(VCTargetsPath)\Platforms\$(Platform)\SCE.Makefile.$(Platform).targets')" Project="$(VCTargetsPath)\Platforms\$(Platform)\SCE.Makefile.$(Platform).targets" />
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>

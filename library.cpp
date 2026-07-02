@@ -9,11 +9,12 @@
 #include <string.h>
 
 #ifndef PLAYGO_ENABLE_LOGGING
-#define PLAYGO_ENABLE_LOGGING 1
+#define PLAYGO_ENABLE_LOGGING 0
 #endif
 
 static constexpr uint32_t kDefaultChunkCount = 1000;
 static constexpr uint32_t kConfigLineSize = 65536;
+static constexpr const char* kPlayGoStubVersion = "0.5";
 
 struct PlayGoState {
     int initialized;
@@ -21,6 +22,7 @@ struct PlayGoState {
     ScePlayGoHandle handle;
     ScePlayGoInstallSpeed install_speed;
     ScePlayGoLanguageMask language_mask;
+    ScePlayGoLanguageMask available_language_mask;
     uint32_t chunk_count;
     uint32_t max_chunk_id;
     uint32_t scenario_count;
@@ -33,6 +35,40 @@ struct PlayGoState {
 
 static PlayGoState g_playgo;
 static char g_config_line[kConfigLineSize];
+static const char kConfigWhitespace[] = " \t\r\n\v\f";
+
+static const char* const kLanguageNames[] = {
+    "japanese",
+    "english_us",
+    "french",
+    "spanish",
+    "german",
+    "italian",
+    "dutch",
+    "portuguese_pt",
+    "russian",
+    "korean",
+    "chinese_t",
+    "chinese_s",
+    "finnish",
+    "swedish",
+    "danish",
+    "norwegian",
+    "polish",
+    "portuguese_br",
+    "english_gb",
+    "turkish",
+    "spanish_la",
+    "arabic",
+    "french_ca",
+    "czech",
+    "hungarian",
+    "greek",
+    "romanian",
+    "thai",
+    "vietnamese",
+    "indonesian",
+};
 
 #if PLAYGO_ENABLE_LOGGING
 static void pg_log_reset(void) {
@@ -65,7 +101,7 @@ static void pg_logf(const char* fmt, ...) { (void)fmt; }
 extern "C" {
     int module_start(size_t args, const void* argp) {
         pg_log_reset();
-        pg_logf("module_start: module loaded args=%zu argp=%p", args, argp);
+        pg_logf("module_start: module loaded version=%s args=%zu argp=%p", kPlayGoStubVersion, args, argp);
         return 0;
     }
 
@@ -146,13 +182,23 @@ static void pg_reset_chunk_ids(uint32_t chunkCount) {
     }
 }
 
+static unsigned long pg_strtoul_preserve_errno(const char* text, char** end, int base) {
+    int savedErrno = errno;
+    unsigned long value = strtoul(text, end, base);
+    errno = savedErrno;
+    return value;
+}
+
 static int pg_parse_chunk_count_line(const char* line, uint32_t* outChunkCount) {
     char* end;
     unsigned long value;
 
-    errno = 0;
-    value = strtoul(line, &end, 10);
-    if (errno != 0 || end == line || value == 0) {
+    value = pg_strtoul_preserve_errno(line, &end, 10);
+    if (end == line || value == 0) {
+        return 0;
+    }
+    end += strspn(end, kConfigWhitespace);
+    if (*end != '\0') {
         return 0;
     }
     if (value > SCE_PLAYGO_CHUNK_INDEX_MAX) {
@@ -173,16 +219,13 @@ static int pg_parse_chunk_id_list_line(char* line) {
     g_playgo.max_chunk_id = 0;
 
     while (*cursor != '\0') {
-        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n' || *cursor == ',') {
-            ++cursor;
-        }
+        cursor += strspn(cursor, " \t\r\n\v\f,");
         if (*cursor == '\0') {
             break;
         }
 
-        errno = 0;
-        unsigned long value = strtoul(cursor, &end, 10);
-        if (errno != 0 || end == cursor || value >= SCE_PLAYGO_CHUNK_INDEX_MAX) {
+        unsigned long value = pg_strtoul_preserve_errno(cursor, &end, 10);
+        if (end == cursor || value >= SCE_PLAYGO_CHUNK_INDEX_MAX) {
             return 0;
         }
         if (!pg_add_chunk_id((ScePlayGoChunkId)value)) {
@@ -191,15 +234,98 @@ static int pg_parse_chunk_id_list_line(char* line) {
         ++added;
 
         cursor = end;
-        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') {
-            ++cursor;
-        }
+        cursor += strspn(cursor, kConfigWhitespace);
         if (*cursor != '\0' && *cursor != ',') {
             return 0;
         }
     }
 
     return added > 0;
+}
+
+static char* pg_trim_config_token(char* text) {
+    char* end;
+
+    text += strspn(text, kConfigWhitespace);
+    end = text + strlen(text);
+    while (end > text && strchr(kConfigWhitespace, end[-1]) != NULL) {
+        --end;
+    }
+    *end = '\0';
+    return text;
+}
+
+static int pg_parse_language_id(char* token, int32_t* outSystemLanguage) {
+    char* end;
+    unsigned long value;
+    size_t i;
+
+    if (token[0] >= '0' && token[0] <= '9') {
+        value = pg_strtoul_preserve_errno(token, &end, 10);
+        if (*end != '\0' || value >= 48u) {
+            return 0;
+        }
+        *outSystemLanguage = (int32_t)value;
+        return 1;
+    }
+
+    for (i = 0; i < sizeof(kLanguageNames) / sizeof(kLanguageNames[0]); ++i) {
+        if (strcasecmp(token, kLanguageNames[i]) == 0) {
+            *outSystemLanguage = (int32_t)i;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int pg_parse_language_hex_mask(char* line, ScePlayGoLanguageMask* outMask) {
+    char* end;
+    unsigned long long value;
+    int parseErrno;
+    int savedErrno = errno;
+
+    errno = 0;
+    value = strtoull(line, &end, 16);
+    parseErrno = errno;
+    errno = savedErrno;
+    if (end <= line + 2 || *end != '\0' || parseErrno == ERANGE) {
+        return 0;
+    }
+    *outMask = (ScePlayGoLanguageMask)value;
+    return 1;
+}
+
+static int pg_parse_language_list(char* line, ScePlayGoLanguageMask* outMask) {
+    char* context = NULL;
+    char* token;
+    size_t lineLength = strlen(line);
+    ScePlayGoLanguageMask mask = 0;
+
+    if (lineLength == 0 || line[0] == ',' || line[lineLength - 1] == ',' || strstr(line, ",,") != NULL) {
+        return 0;
+    }
+
+    for (token = strtok_r(line, ",", &context); token != NULL; token = strtok_r(NULL, ",", &context)) {
+        int32_t systemLanguage;
+
+        token = pg_trim_config_token(token);
+        if (*token == '\0' || !pg_parse_language_id(token, &systemLanguage)) {
+            return 0;
+        }
+        mask |= scePlayGoConvertLanguage(systemLanguage);
+    }
+
+    *outMask = mask;
+    return 1;
+}
+
+static int pg_parse_language_config_line(char* line, ScePlayGoLanguageMask* outMask) {
+    char* value = pg_trim_config_token(line);
+
+    if (value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
+        return pg_parse_language_hex_mask(value, outMask);
+    }
+    return pg_parse_language_list(value, outMask);
 }
 
 /*
@@ -214,6 +340,7 @@ static void pg_set_defaults(void) {
     g_playgo.handle = 1;
     g_playgo.install_speed = SCE_PLAYGO_INSTALL_SPEED_TRICKLE;
     g_playgo.language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
+    g_playgo.available_language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
     g_playgo.scenario_count = 0;
     g_playgo.config_loaded_from_file = 0;
     pg_reset_chunk_ids(kDefaultChunkCount);
@@ -225,8 +352,10 @@ static void pg_set_defaults(void) {
  * File format:
  *   line 1: chunk count, or comma-separated valid chunk id list
  *   line 2: scenario count (optional)
+ *   line 3: language mask (0x...) or comma-separated language id/name list (optional)
  *
- * If the file is missing or malformed, the stub falls back to 1000 chunks.
+ * If the file is missing or the chunk line is malformed, the stub falls back to
+ * 1000 chunks. An invalid language line falls back to all languages independently.
  * Chunk ids are valid in the half-open range [0, chunk_count), so a 1000-chunk
  * package exposes ids 0..999 and reports BAD_CHUNK_ID for 1000. If line 1
  * contains commas, it is treated as the exact valid chunk id list instead.
@@ -237,16 +366,21 @@ static void pg_load_config(void) {
     unsigned long value;
     uint32_t chunkCount;
     int parsedChunkConfig = 0;
+    ScePlayGoLanguageMask languageMask;
 
     pg_reset_chunk_ids(kDefaultChunkCount);
     g_playgo.scenario_count = 0;
+    g_playgo.language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
+    g_playgo.available_language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
     g_playgo.config_loaded_from_file = 0;
 
     fp = fopen("/app0/playgo_stub.dat", "rb");
     if (fp == NULL) {
-        pg_logf("config: using defaults chunk_count=%u scenario_count=%u",
+        pg_logf("config: using defaults chunk_count=%u scenario_count=%u available_language_mask=0x%016llx current_language_mask=0x%016llx",
             g_playgo.chunk_count,
-            g_playgo.scenario_count);
+            g_playgo.scenario_count,
+            (unsigned long long)g_playgo.available_language_mask,
+            (unsigned long long)g_playgo.language_mask);
         return;
     }
 
@@ -262,19 +396,27 @@ static void pg_load_config(void) {
         pg_reset_chunk_ids(kDefaultChunkCount);
     }
 
-    errno = 0;
     if (fgets(line, sizeof(line), fp) != NULL) {
-        value = strtoul(line, NULL, 10);
-        if (errno == 0) {
-            g_playgo.scenario_count = (uint32_t)value;
+        value = pg_strtoul_preserve_errno(line, NULL, 10);
+        g_playgo.scenario_count = (uint32_t)value;
+    }
+
+    if (fgets(line, sizeof(line), fp) != NULL) {
+        if (pg_parse_language_config_line(line, &languageMask)) {
+            g_playgo.available_language_mask = languageMask;
+            g_playgo.language_mask = languageMask;
+        } else {
+            pg_logf("config: invalid language configuration, using all languages");
         }
     }
 
     fclose(fp);
     g_playgo.config_loaded_from_file = 1;
-    pg_logf("config: loaded chunk_count=%u scenario_count=%u",
+    pg_logf("config: loaded chunk_count=%u scenario_count=%u available_language_mask=0x%016llx current_language_mask=0x%016llx",
         g_playgo.chunk_count,
-        g_playgo.scenario_count);
+        g_playgo.scenario_count,
+        (unsigned long long)g_playgo.available_language_mask,
+        (unsigned long long)g_playgo.language_mask);
 }
 
 /*
@@ -316,6 +458,20 @@ static int pg_valid_count(uint32_t count) {
 static int pg_valid_optional_type(ScePlayGoOptionalChunkType type) {
     return type >= SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_LANGUAGE &&
         type <= SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_OBSERVED_RESERVED;
+}
+
+static int pg_language_mask_is_available(ScePlayGoLanguageMask languageMask) {
+    return (languageMask & ~g_playgo.available_language_mask) == 0;
+}
+
+static int32_t pg_validate_optional_language_mask(
+    ScePlayGoOptionalChunkType type,
+    const ScePlayGoOptionalChunk* option) {
+    if (type == SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_LANGUAGE &&
+        !pg_language_mask_is_available(option->languages)) {
+        return SCE_PLAYGO_ERROR_BAD_LANG_CONFIGURATION;
+    }
+    return SCE_OK;
 }
 
 /*
@@ -378,23 +534,6 @@ static int32_t pg_validate_chunk_list(const ScePlayGoChunkId* chunkIds, uint32_t
     }
 
     return SCE_OK;
-}
-
-/*
- * Return a scenario bitmask with all configured scenarios enabled.
- *
- * Scenario masks are 64-bit wide in the ABI. When the configuration says there
- * are more than 64 scenarios, the stub reports all 64 bits set because that is
- * the maximum representable value in the public API.
- */
-static uint64_t pg_scenario_mask_all(void) {
-    if (g_playgo.scenario_count >= 64) {
-        return ~0ULL;
-    }
-    if (g_playgo.scenario_count == 0) {
-        return 0ULL;
-    }
-    return (1ULL << g_playgo.scenario_count) - 1ULL;
 }
 
 /*
@@ -467,10 +606,12 @@ extern "C" {
         pg_set_defaults();
         pg_load_config();
         g_playgo.initialized = 1;
-        pg_logf("scePlayGoInitialize rc=0 chunk_count=%u scenario_count=%u config_source=%s language_mask=0x%016llx install_speed=%d",
+        pg_logf("scePlayGoInitialize rc=0 version=%s chunk_count=%u scenario_count=%u config_source=%s available_language_mask=0x%016llx current_language_mask=0x%016llx install_speed=%d",
+            kPlayGoStubVersion,
             g_playgo.chunk_count,
             g_playgo.scenario_count,
             g_playgo.config_loaded_from_file ? "file" : "defaults",
+            (unsigned long long)g_playgo.available_language_mask,
             (unsigned long long)g_playgo.language_mask,
             g_playgo.install_speed);
         return SCE_OK;
@@ -740,18 +881,22 @@ extern "C" {
     /*
      * Override the active language mask.
      *
-     * This allows a title to test language-specific optional chunk paths while the
-     * rest of the stub continues to report that those chunks are already available.
+     * The requested set must be a subset of the languages exposed by the runtime
+     * configuration.
      */
     PRX_INTERFACE int32_t scePlayGoSetLanguageMask(ScePlayGoHandle handle, ScePlayGoLanguageMask languageMask) {
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
         if (rc != SCE_OK) goto done;
+        if (!pg_language_mask_is_available(languageMask)) {
+            rc = SCE_PLAYGO_ERROR_BAD_LANG_CONFIGURATION;
+            goto done;
+        }
         g_playgo.language_mask = languageMask;
         rc = SCE_OK;
     done:
-        pg_logf("scePlayGoSetLanguageMask rc=%d handle=%d mask=0x%016llx", rc, handle, (unsigned long long)languageMask);
+        pg_logf("scePlayGoSetLanguageMask rc=%d handle=%d requested=0x%016llx available=0x%016llx current=0x%016llx", rc, handle, (unsigned long long)languageMask, (unsigned long long)g_playgo.available_language_mask, (unsigned long long)g_playgo.language_mask);
         return rc;
     }
 
@@ -831,9 +976,8 @@ extern "C" {
     /*
      * Return the currently available optional chunk set.
      *
-     * The stub reports all bits set for every optional chunk category. This is the
-     * most permissive answer and lets titles proceed as if all optional content is
-     * already present.
+     * Language queries return the active language selection. Other optional chunk
+     * categories retain the permissive all-bits-set behavior.
      */
     PRX_INTERFACE int32_t scePlayGoGetOptionalChunk(ScePlayGoHandle handle, ScePlayGoOptionalChunkType type, ScePlayGoOptionalChunk* option) {
         int32_t rc = pg_require_initialized();
@@ -841,8 +985,10 @@ extern "C" {
         rc = pg_require_handle(handle);
         if (rc != SCE_OK) goto done;
         if (option == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
-        (void)type;
-        option->bitmask = ~0ULL;
+        if (!pg_valid_optional_type(type)) { rc = SCE_PLAYGO_ERROR_BAD_OPTIONAL_TYPE; goto done; }
+        option->bitmask = (type == SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_LANGUAGE)
+            ? g_playgo.language_mask
+            : ~0ULL;
         rc = SCE_OK;
     done:
         pg_logf("scePlayGoGetOptionalChunk rc=%d handle=%d type=%d value=0x%016llx", rc, handle, type, (unsigned long long)((rc == SCE_OK && option != NULL) ? option->bitmask : 0ULL));
@@ -862,6 +1008,8 @@ extern "C" {
         if (rc != SCE_OK) goto done;
         if (option == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
         if (!pg_valid_optional_type(type)) { rc = SCE_PLAYGO_ERROR_BAD_OPTIONAL_TYPE; goto done; }
+        rc = pg_validate_optional_language_mask(type, option);
+        if (rc != SCE_OK) goto done;
         rc = SCE_OK;
     done:
         pg_logf("scePlayGoPrefetchOptionalChunk rc=%d handle=%d type=%d requested=0x%016llx", rc, handle, type, pg_optional_mask_value(option));
@@ -894,7 +1042,8 @@ extern "C" {
     /*
      * Return which optional chunks are supported by the title.
      *
-     * The stub mirrors GetOptionalChunk and exposes all bits as supported.
+     * Language queries return the configured availability boundary. Other optional
+     * chunk categories retain the permissive all-bits-set behavior.
      */
     PRX_INTERFACE int32_t scePlayGoGetSupportedOptionalChunk(ScePlayGoHandle handle, ScePlayGoOptionalChunkType type, ScePlayGoOptionalChunk* option) {
         int32_t rc = pg_require_initialized();
@@ -902,8 +1051,10 @@ extern "C" {
         rc = pg_require_handle(handle);
         if (rc != SCE_OK) goto done;
         if (option == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
-        (void)type;
-        option->bitmask = ~0ULL;
+        if (!pg_valid_optional_type(type)) { rc = SCE_PLAYGO_ERROR_BAD_OPTIONAL_TYPE; goto done; }
+        option->bitmask = (type == SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_LANGUAGE)
+            ? g_playgo.available_language_mask
+            : ~0ULL;
         rc = SCE_OK;
     done:
         pg_logf("scePlayGoGetSupportedOptionalChunk rc=%d handle=%d type=%d value=0x%016llx", rc, handle, type, (unsigned long long)((rc == SCE_OK && option != NULL) ? option->bitmask : 0ULL));
@@ -959,9 +1110,11 @@ extern "C" {
         }
         fprintf(fp,
             "PlayGo PRX stub\n"
+            "version=%s\n"
             "status=ok\n"
             "chunk_count=%u\n"
             "scenario_count=%u\n",
+            kPlayGoStubVersion,
             g_playgo.chunk_count,
             g_playgo.scenario_count);
         fclose(fp);
@@ -983,6 +1136,8 @@ extern "C" {
         if (rc != SCE_OK) goto done;
         if (option == NULL || outRequiredDisc == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
         if (!pg_valid_optional_type(type)) { rc = SCE_PLAYGO_ERROR_BAD_OPTIONAL_TYPE; goto done; }
+        rc = pg_validate_optional_language_mask(type, option);
+        if (rc != SCE_OK) goto done;
         *outRequiredDisc = 0;
         rc = SCE_OK;
     done:
