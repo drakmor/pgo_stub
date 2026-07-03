@@ -28,7 +28,7 @@ STB_GLOBAL = 1
 STT_OBJECT = 1
 STT_FUNC = 2
 
-STUB = {
+STUB_LIBC_INTERNAL = {
     "soname": "libSceLibcInternal.prx",
     "module": "libSceLibcInternal",
     "library": "libSceLibcInternal",
@@ -70,6 +70,24 @@ STUB = {
         ("memset", STT_FUNC),
         ("vfprintf", STT_FUNC),
     ],
+}
+
+# The IPMI client entry points used to ask ShellCore to stop the title. The SDK
+# ships no stub for libSceIpmi at all, and these are C++ symbols, so they are
+# listed by their mangled names -- the NID is derived from the name as written.
+STUB_IPMI = {
+    "soname": "libSceIpmi.prx",
+    "module": "libSceIpmi",
+    "library": "libSceIpmi",
+    "symbols": [
+        ("_ZN4IPMI6Client6ConfigC1Ev", STT_FUNC),
+        ("_ZN4IPMI6Client6createEPPS0_PKNS0_6ConfigEPvS6_", STT_FUNC),
+    ],
+}
+
+STUBS = {
+    "libcinternal": STUB_LIBC_INTERNAL,
+    "ipmi": STUB_IPMI,
 }
 
 
@@ -116,7 +134,7 @@ def section_header(name: int,
                        entsize)
 
 
-def build_stub() -> bytes:
+def build_stub(stub: dict) -> bytes:
     shstr = bytearray(b"\0.shstrtab\0.dynamic\0.scenid\0.dynstr\0.dynsym\0")
     sh_name = {
         ".shstrtab": shstr.index(b".shstrtab"),
@@ -128,11 +146,11 @@ def build_stub() -> bytes:
 
     dynstr = bytearray(b"\0")
     str_offsets: dict[str, int] = {"": 0}
-    symbols = STUB["symbols"]
+    symbols = stub["symbols"]
     symbol_offsets = [add_string(dynstr, str_offsets, name) for name, _ty in symbols]
-    soname_offset = add_string(dynstr, str_offsets, STUB["soname"])
-    module_offset = add_string(dynstr, str_offsets, STUB["module"])
-    library_offset = add_string(dynstr, str_offsets, STUB["library"])
+    soname_offset = add_string(dynstr, str_offsets, stub["soname"])
+    module_offset = add_string(dynstr, str_offsets, stub["module"])
+    library_offset = add_string(dynstr, str_offsets, stub["library"])
 
     dynamic = b"".join([
         struct.pack("<QQ", DT_SONAME, soname_offset),
@@ -204,11 +222,13 @@ def build_stub() -> bytes:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--out")
+    parser.add_argument("--stub", choices=sorted(STUBS), default="libcinternal")
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
+    stub = STUBS[args.stub]
 
     if args.check:
-        for name, _ty in STUB["symbols"]:
+        for name, _ty in stub["symbols"]:
             print(f"{name} {nid_string(name)}")
         return 0
 
@@ -217,7 +237,7 @@ def main() -> int:
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_bytes(build_stub())
+    out_path.write_bytes(build_stub(stub))
     return 0
 
 

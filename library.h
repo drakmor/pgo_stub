@@ -56,6 +56,9 @@ extern "C" {
 #define SCE_PLAYGO_MAX_ETA_VALUE     (9223372036854775807LL)
 #define SCE_PLAYGO_LANGUAGE_MASK_ALL (0xFFFFFFFFFFFFFFFFULL)
 
+/* libSceSystemService param id, used for console system-language detection. */
+#define SCE_SYSTEM_SERVICE_PARAM_ID_LANG (1)
+
     typedef enum ScePlayGoLocusValue {
         SCE_PLAYGO_LOCUS_NOT_DOWNLOADED = 0,
         SCE_PLAYGO_LOCUS_LOCAL_SLOW = 2,

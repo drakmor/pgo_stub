@@ -1,0 +1,18 @@
+# Per-developer MSBuild state, not project configuration
+*.vcxproj.user
+.vs/
+
+# Build output
+out/
+Prospero_Debug/
+Prospero_Release/
+Prospero_ReleaseLog/
+Prospero_ReleaseNoLog/
+sce_module/
+*.prx
+*.sprx
+*.elf
+
+# Runtime artifacts
+playlgo.log
+playgo_stub.dat
