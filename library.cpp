@@ -436,6 +436,17 @@ static int pg_parse_chunk_count_line(const char* line, uint32_t* outChunkCount) 
     char* end;
     unsigned long value;
 
+    /*
+     * strtoul accepts a leading sign and wraps, so "-5" parses cleanly, passes
+     * the trailing check below, and clamps to SCE_PLAYGO_CHUNK_INDEX_MAX -- a
+     * wrong line silently reporting the maximum chunk count instead of stopping
+     * the title. Returning 0 here hands it to the chunk id list parser, which
+     * turns the wrapped value away on its own bound, so it reaches
+     * pg_config_fatal like any other bad first line.
+     */
+    if (*line == '-' || *line == '+') {
+        return 0;
+    }
     value = pg_strtoul_preserve_errno(line, &end, 10);
     if (end == line || value == 0) {
         return 0;
