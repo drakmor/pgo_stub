@@ -9,7 +9,7 @@
 #include <string.h>
 
 #ifndef PLAYGO_ENABLE_LOGGING
-#define PLAYGO_ENABLE_LOGGING 0
+#define PLAYGO_ENABLE_LOGGING 1
 #endif
 
 static constexpr uint32_t kDefaultChunkCount = 1000;
@@ -23,6 +23,8 @@ struct PlayGoState {
     ScePlayGoInstallSpeed install_speed;
     ScePlayGoLanguageMask language_mask;
     ScePlayGoLanguageMask available_language_mask;
+    int console_language_fallback;
+    int config_error;
     uint32_t chunk_count;
     uint32_t max_chunk_id;
     uint32_t scenario_count;
@@ -70,6 +72,93 @@ static const char* const kLanguageNames[] = {
     "indonesian",
 };
 
+/* Console system-language query; see README, "Language Selection and Fallback". */
+extern "C" int32_t sceSystemServiceParamGetInt(int32_t paramId, int32_t* value);
+
+/*
+ * How long the stop toast counts down before the title is closed, matching the
+ * hold unilibrary's gate uses so the two feel like the same event to a user.
+ */
+static constexpr uint32_t kConfigStopSeconds = 12;
+
+/* How much of an offending config line is quoted back in the toast. */
+static constexpr size_t kConfigExcerptSize = 64;
+
+/*
+ * Stopping the title goes through ShellCore, not through exit().
+ *
+ * A title cannot reach sceSystemServiceLoadExec from inside a module, so the
+ * IPMI request that export makes is reproduced here: connect to SceLncService
+ * and invoke its LoadExec command. ShellCore KILLS THE CALLER THE MOMENT IT
+ * ACCEPTS, before it tries to launch anything, so the stop does not depend on
+ * the replacement process starting - or existing. What LoadExec requires is a
+ * non-empty path; it is never compared against any literal.
+ *
+ * The path named is the config file itself. It is guaranteed to exist, because
+ * this path only runs when a line in it was read and rejected, and it can never
+ * be spawned as a process, so there is no way for a handover to turn into a
+ * relaunch of the title that just stopped.
+ *
+ * Being killed by ShellCore keeps the stop on a route ShellCore initiated and
+ * understands, which exit() does not.
+ */
+#define PG_LNC_IPMI_SERVICE "SceLncService"
+#define PG_LNC_CMD_LOADEXEC 0x3000Du
+#define PG_LNC_QUIT_PATH "/app0/playgo_stub.dat"
+
+/* Client storage sized as the firmware sizes its own IPMI clients. Guessing
+ * down on a reversed ABI is the one direction that corrupts memory. */
+#define PG_IPMI_CLIENT_STORAGE 0xf800u
+#define PG_IPMI_REQUEST_BUFFER 0x200u
+
+struct PgIpcBuffer {
+    void* data;
+    uint64_t size;
+};
+
+typedef int32_t (*PgIpmiClientConnect)(void*, uint64_t, uint64_t, int32_t*);
+typedef int32_t (*PgIpmiClientInvoke)(void*, uint32_t, const PgIpcBuffer*, uint32_t, int32_t*, PgIpcBuffer*, uint32_t);
+
+/*
+ * Bound by mangled name: these are C++ entry points with no C declaration.
+ *
+ * WEAK ON PURPOSE. Linking the stub archive names libSceIpmi as a dependency
+ * either way, so this is not about avoiding that; it is about the module that
+ * answers. A title can be running against a substitute libSceIpmi that exports
+ * a different set of symbols than the firmware one, and a strong reference
+ * would turn that into a module that will not load. Weak leaves the pointers
+ * NULL instead, the request is skipped, and the caller falls back to failing
+ * scePlayGoInitialize - which still stops the title.
+ */
+extern "C" void pg_ipmi_client_config_ctor(void*) __asm__("_ZN4IPMI6Client6ConfigC1Ev") __attribute__((weak));
+extern "C" int32_t pg_ipmi_client_create(void**, const void*, void*, void*) __asm__("_ZN4IPMI6Client6createEPPS0_PKNS0_6ConfigEPvS6_") __attribute__((weak));
+
+static unsigned char g_ipmi_client_storage[PG_IPMI_CLIENT_STORAGE] __attribute__((aligned(16)));
+
+/*
+ * System notification request. The kernel takes a fixed 3120-byte block whose
+ * message field starts at offset 45; everything else is zero for a plain text
+ * toast.
+ */
+struct PgNotificationRequest {
+    char unused[45];
+    char message[3075];
+};
+
+extern "C" int sceKernelSendNotificationRequest(int target, PgNotificationRequest* req, unsigned long size, int blocking);
+extern "C" int sceKernelUsleep(unsigned int microseconds);
+
+/* Console system-language bit (1<<(63-code)); 0 (and *outCode=-1) if unavailable. */
+static ScePlayGoLanguageMask pg_console_language_bit(int32_t* outCode) {
+    int32_t lang = -1;
+    if (sceSystemServiceParamGetInt(SCE_SYSTEM_SERVICE_PARAM_ID_LANG, &lang) != SCE_OK) {
+        if (outCode != NULL) { *outCode = -1; }
+        return 0;
+    }
+    if (outCode != NULL) { *outCode = lang; }
+    return scePlayGoConvertLanguage(lang);
+}
+
 #if PLAYGO_ENABLE_LOGGING
 static void pg_log_reset(void) {
     FILE* fp = fopen("/app0/playlgo.log", "wb");
@@ -97,6 +186,160 @@ static void pg_logf(const char* fmt, ...) {
 static void pg_log_reset(void) {}
 static void pg_logf(const char* fmt, ...) { (void)fmt; }
 #endif
+
+/* Put a line of text on screen. Toasts are the only channel a user sees. */
+static void pg_notify(const char* body) {
+    PgNotificationRequest req;
+
+    memset(&req, 0, sizeof(req));
+    /* snprintf, not strncpy: it is already imported from libSceLibcInternal,
+     * and strncpy is the one libc symbol that would pull libc.prx in as a whole
+     * extra NEEDED module for a stub that has to load inside any title. */
+    snprintf(req.message, sizeof(req.message), "%s", body);
+    (void)sceKernelSendNotificationRequest(0, &req, sizeof(req), 0);
+}
+
+/*
+ * Ask ShellCore to replace this title. Returns only if it refused.
+ */
+static void pg_request_title_stop(void) {
+    unsigned char config[0x180] __attribute__((aligned(16)));
+    static const char kService[16] = PG_LNC_IPMI_SERVICE;
+    /* Buffer 0 points AT the argument length: ShellCore reads four bytes from
+     * that address rather than taking the value. */
+    uint32_t argsLength = 0;
+    PgIpcBuffer bufs[3];
+    void* client = NULL;
+    int32_t serviceResult = 0;
+    void** vtable;
+    PgIpmiClientConnect connect;
+    PgIpmiClientInvoke invoke;
+    int32_t rc;
+    size_t i;
+
+    if (pg_ipmi_client_config_ctor == NULL || pg_ipmi_client_create == NULL) {
+        pg_logf("stop: libSceIpmi is not loaded in this title, cannot ask ShellCore");
+        return;
+    }
+
+    memset(config, 0, sizeof(config));
+    pg_ipmi_client_config_ctor(config);
+    /* Flat 16 bytes; the firmware strlcpys the service name into this field. */
+    for (i = 0; i < sizeof(kService); ++i) {
+        config[i] = (unsigned char)kService[i];
+    }
+    *(uint64_t*)(config + 0x10) = 0;
+    *(uint64_t*)(config + 0x28) = PG_IPMI_REQUEST_BUFFER;
+    *(uint64_t*)(config + 0x30) = PG_IPMI_CLIENT_STORAGE;
+
+    rc = pg_ipmi_client_create(&client, config, NULL, g_ipmi_client_storage);
+    if (rc < 0 || client == NULL) {
+        pg_logf("stop: ipmi client create failed rc=%d", rc);
+        return;
+    }
+
+    vtable = *(void***)client;
+    connect = (PgIpmiClientConnect)vtable[2];
+    rc = connect(client, 0, 0, &serviceResult);
+    if (rc < 0 || serviceResult < 0) {
+        pg_logf("stop: connect to %s failed rc=%d service_result=%d", PG_LNC_IPMI_SERVICE, rc, serviceResult);
+        return;
+    }
+
+    bufs[0].data = &argsLength;
+    bufs[0].size = sizeof(argsLength);
+    bufs[1].data = (void*)PG_LNC_QUIT_PATH;
+    bufs[1].size = strlen(PG_LNC_QUIT_PATH) + 1;
+    /* No argv: a null pointer with length zero, as the firmware sends. */
+    bufs[2].data = NULL;
+    bufs[2].size = 0;
+
+    serviceResult = 0;
+    invoke = (PgIpmiClientInvoke)vtable[11];
+
+    /*
+     * Logged BEFORE the call, because the process is killed inside it: a line
+     * written afterwards can never be reached on the path that works. So this
+     * line means "the request is going out", and its being the last line in the
+     * log is what success looks like.
+     */
+    pg_logf("stop: requesting title stop through %s path=%s", PG_LNC_IPMI_SERVICE, PG_LNC_QUIT_PATH);
+
+    rc = invoke(client, PG_LNC_CMD_LOADEXEC, bufs, 3, &serviceResult, NULL, 0);
+    if (rc == 0) {
+        rc = serviceResult;
+    }
+    pg_logf("stop: ShellCore did not take the request rc=%d", rc);
+}
+
+/*
+ * Stop the title because playgo_stub.dat has a line that cannot be understood.
+ *
+ * A typo must never quietly turn into a default. Every silent fallback here
+ * produces a title that runs with settings its author did not choose - the
+ * wrong chunk count, or every language reported as installed - and the only
+ * evidence is a log line in a build that may not have logging compiled in. A
+ * toast naming the file, the line and the text that failed is worth more than a
+ * title that limps.
+ *
+ * A MISSING FILE IS NOT AN ERROR and never reaches here: the config is
+ * optional, and so is every line after the first. This is only for a line that
+ * is present and wrong.
+ *
+ * Returns only if ShellCore refused to stop the title, in which case
+ * config_error is set and scePlayGoInitialize fails.
+ */
+static void pg_config_fatal(const char* detail) {
+    char message[512];
+    uint32_t i;
+
+    pg_logf("config: fatal: %s", detail);
+
+    snprintf(message, sizeof(message),
+        "libScePlayGo: %s\n\nFix /app0/playgo_stub.dat or delete it to use defaults.", detail);
+    pg_notify(message);
+
+    /*
+     * Let the notification service take the first request before sending the
+     * next one: it hands the message to another process, and going away
+     * instantly turns the diagnostic toast back into the silent failure this
+     * path exists to prevent.
+     */
+    (void)sceKernelUsleep(300u * 1000u);
+
+    snprintf(message, sizeof(message),
+        "libScePlayGo: closing this title in %u seconds...", kConfigStopSeconds);
+    pg_notify(message);
+
+    for (i = 0; i < kConfigStopSeconds; ++i) {
+        (void)sceKernelUsleep(1000u * 1000u);
+    }
+
+    pg_request_title_stop();
+
+    /*
+     * Still running, so ShellCore never accepted the request. The title must not
+     * continue on settings its author did not choose, so the failure is recorded
+     * and scePlayGoInitialize refuses instead - a title's own error handling is
+     * a better place to end up than a PlayGo that quietly reports defaults.
+     */
+    g_playgo.config_error = 1;
+    pg_logf("config: title stop was refused, scePlayGoInitialize will fail");
+}
+
+/* Copy a config line into a short, trimmed, quotable excerpt for a toast. */
+static char* pg_trim_config_token(char* text);
+
+static void pg_config_excerpt(char* out, size_t outSize, const char* line) {
+    char scratch[kConfigExcerptSize];
+    size_t i;
+
+    for (i = 0; i + 1 < sizeof(scratch) && line[i] != '\0' && line[i] != '\n'; ++i) {
+        scratch[i] = line[i];
+    }
+    scratch[i] = '\0';
+    snprintf(out, outSize, "%s", pg_trim_config_token(scratch));
+}
 
 extern "C" {
     int module_start(size_t args, const void* argp) {
@@ -193,6 +436,17 @@ static int pg_parse_chunk_count_line(const char* line, uint32_t* outChunkCount) 
     char* end;
     unsigned long value;
 
+    /*
+     * strtoul accepts a leading sign and wraps, so "-5" parses cleanly, passes
+     * the trailing check below, and clamps to SCE_PLAYGO_CHUNK_INDEX_MAX -- a
+     * wrong line silently reporting the maximum chunk count instead of stopping
+     * the title. Returning 0 here hands it to the chunk id list parser, which
+     * turns the wrapped value away on its own bound, so it reaches
+     * pg_config_fatal like any other bad first line.
+     */
+    if (*line == '-' || *line == '+') {
+        return 0;
+    }
     value = pg_strtoul_preserve_errno(line, &end, 10);
     if (end == line || value == 0) {
         return 0;
@@ -256,18 +510,7 @@ static char* pg_trim_config_token(char* text) {
 }
 
 static int pg_parse_language_id(char* token, int32_t* outSystemLanguage) {
-    char* end;
-    unsigned long value;
     size_t i;
-
-    if (token[0] >= '0' && token[0] <= '9') {
-        value = pg_strtoul_preserve_errno(token, &end, 10);
-        if (*end != '\0' || value >= 48u) {
-            return 0;
-        }
-        *outSystemLanguage = (int32_t)value;
-        return 1;
-    }
 
     for (i = 0; i < sizeof(kLanguageNames) / sizeof(kLanguageNames[0]); ++i) {
         if (strcasecmp(token, kLanguageNames[i]) == 0) {
@@ -295,12 +538,21 @@ static int pg_parse_language_hex_mask(char* line, ScePlayGoLanguageMask* outMask
     return 1;
 }
 
-static int pg_parse_language_list(char* line, ScePlayGoLanguageMask* outMask) {
+/*
+ * Parse a comma-separated list of language names into an OR of their bits.
+ *
+ * On failure the token that could not be understood is copied into outBadToken
+ * (empty when the list itself is malformed rather than one entry), so the
+ * caller can name it in the toast instead of quoting the whole line.
+ */
+static int pg_parse_language_list(char* line, ScePlayGoLanguageMask* outMask, char* outBadToken, size_t badTokenSize) {
     char* context = NULL;
     char* token;
     size_t lineLength = strlen(line);
     ScePlayGoLanguageMask mask = 0;
+    int count = 0;
 
+    outBadToken[0] = '\0';
     if (lineLength == 0 || line[0] == ',' || line[lineLength - 1] == ',' || strstr(line, ",,") != NULL) {
         return 0;
     }
@@ -310,22 +562,73 @@ static int pg_parse_language_list(char* line, ScePlayGoLanguageMask* outMask) {
 
         token = pg_trim_config_token(token);
         if (*token == '\0' || !pg_parse_language_id(token, &systemLanguage)) {
+            snprintf(outBadToken, badTokenSize, "%s", token);
             return 0;
         }
         mask |= scePlayGoConvertLanguage(systemLanguage);
+        ++count;
+    }
+    if (count == 0) {
+        return 0;
     }
 
     *outMask = mask;
     return 1;
 }
 
-static int pg_parse_language_config_line(char* line, ScePlayGoLanguageMask* outMask) {
+static int pg_parse_language_config_line(char* line, ScePlayGoLanguageMask* outMask, char* outBadToken, size_t badTokenSize) {
     char* value = pg_trim_config_token(line);
 
+    outBadToken[0] = '\0';
+    /*
+     * "all" is the way to say "every language ships" on purpose. Blank lines are
+     * skipped rather than counted (see pg_next_config_value), so without a
+     * spelling for the default there would be no way to leave line 3 at its
+     * default while still setting line 4.
+     */
+    if (strcasecmp(value, "all") == 0) {
+        *outMask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
+        return 1;
+    }
     if (value[0] == '0' && (value[1] == 'x' || value[1] == 'X')) {
         return pg_parse_language_hex_mask(value, outMask);
     }
-    return pg_parse_language_list(value, outMask);
+    return pg_parse_language_list(value, outMask, outBadToken, badTokenSize);
+}
+
+/*
+ * Parse the optional console-language fallback flag (fourth config line).
+ *
+ * Accepts 1/on/yes/true and 0/off/no/false, case-insensitively; an empty line
+ * means disabled. Returns 1 when the line was understood, 0 otherwise.
+ *
+ * The flag is off by default, which keeps the reported language sets a pure
+ * function of the config file: every console running the same package sees the
+ * same masks. See pg_load_config and the README for what enabling it changes.
+ */
+static int pg_parse_console_fallback_line(char* line, int* outEnabled) {
+    static const char* const kEnabledNames[] = { "1", "on", "yes", "true" };
+    static const char* const kDisabledNames[] = { "0", "off", "no", "false" };
+    char* value = pg_trim_config_token(line);
+    size_t i;
+
+    if (*value == '\0') {
+        *outEnabled = 0;
+        return 1;
+    }
+    for (i = 0; i < sizeof(kEnabledNames) / sizeof(kEnabledNames[0]); ++i) {
+        if (strcasecmp(value, kEnabledNames[i]) == 0) {
+            *outEnabled = 1;
+            return 1;
+        }
+    }
+    for (i = 0; i < sizeof(kDisabledNames) / sizeof(kDisabledNames[0]); ++i) {
+        if (strcasecmp(value, kDisabledNames[i]) == 0) {
+            *outEnabled = 0;
+            return 1;
+        }
+    }
+    return 0;
 }
 
 /*
@@ -341,9 +644,37 @@ static void pg_set_defaults(void) {
     g_playgo.install_speed = SCE_PLAYGO_INSTALL_SPEED_TRICKLE;
     g_playgo.language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
     g_playgo.available_language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
+    g_playgo.console_language_fallback = 0;
     g_playgo.scenario_count = 0;
     g_playgo.config_loaded_from_file = 0;
     pg_reset_chunk_ids(kDefaultChunkCount);
+}
+
+/*
+ * Read the next line that carries a value.
+ *
+ * Everything from a '#' to the end of the line is a comment, and a line that
+ * holds nothing but a comment or whitespace is skipped entirely rather than
+ * counted as one of the numbered lines below. That is what lets the file carry
+ * a header comment, or a note above a value, without silently shifting what
+ * every following line means.
+ *
+ * -> the trimmed value, or NULL at end of file.
+ */
+static char* pg_next_config_value(FILE* fp, char* line, uint32_t size) {
+    while (fgets(line, (int)size, fp) != NULL) {
+        char* comment = strchr(line, '#');
+        char* value;
+
+        if (comment != NULL) {
+            *comment = '\0';
+        }
+        value = pg_trim_config_token(line);
+        if (*value != '\0') {
+            return value;
+        }
+    }
+    return NULL;
 }
 
 /*
@@ -352,10 +683,23 @@ static void pg_set_defaults(void) {
  * File format:
  *   line 1: chunk count, or comma-separated valid chunk id list
  *   line 2: scenario count (optional)
- *   line 3: language mask (0x...) or comma-separated language id/name list (optional)
+ *   line 3: shipped voice languages - comma-separated language name list (e.g.
+ *           "english_us,french,german"), or a raw 0x... installed mask (optional)
+ *   line 4: console-language fallback flag, 0/1 (optional, default 0)
  *
- * If the file is missing or the chunk line is malformed, the stub falls back to
- * 1000 chunks. An invalid language line falls back to all languages independently.
+ * '#' starts a comment, and a blank or comment-only line does not count as one
+ * of the numbered lines above. Line 3 takes "all" for every language.
+ *
+ * The file is optional and so is every line after the first; a missing file
+ * means 1000 chunks and all languages. A line that IS present and cannot be
+ * parsed stops the title through pg_config_fatal rather than falling back to a
+ * default the author did not choose.
+ * With line 4 absent or 0 the installed and supported language sets are both the
+ * line 3 set, so the stub reports the same thing on every console. With line 4
+ * set to 1 the console's current system language is added to the supported set
+ * only, for titles that run their own voice fallback when the console language
+ * is supported but not installed; the console language is never reported as
+ * installed.
  * Chunk ids are valid in the half-open range [0, chunk_count), so a 1000-chunk
  * package exposes ids 0..999 and reports BAD_CHUNK_ID for 1000. If line 1
  * contains commas, it is treated as the exact valid chunk id list instead.
@@ -367,11 +711,19 @@ static void pg_load_config(void) {
     uint32_t chunkCount;
     int parsedChunkConfig = 0;
     ScePlayGoLanguageMask languageMask;
+    int parsedLanguageConfig = 0;
+    int consoleFallback = 0;
+    char* valueLine;
+    char excerpt[kConfigExcerptSize];
+    char badToken[kConfigExcerptSize];
+    char detail[256];
 
     pg_reset_chunk_ids(kDefaultChunkCount);
     g_playgo.scenario_count = 0;
     g_playgo.language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
     g_playgo.available_language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
+    g_playgo.console_language_fallback = 0;
+    g_playgo.config_error = 0;
     g_playgo.config_loaded_from_file = 0;
 
     fp = fopen("/app0/playgo_stub.dat", "rb");
@@ -384,39 +736,104 @@ static void pg_load_config(void) {
         return;
     }
 
-    if (fgets(line, sizeof(line), fp) != NULL) {
-        if (strchr(line, ',') != NULL) {
-            parsedChunkConfig = pg_parse_chunk_id_list_line(line);
-        } else if (pg_parse_chunk_count_line(line, &chunkCount)) {
+    valueLine = pg_next_config_value(fp, line, kConfigLineSize);
+    if (valueLine != NULL) {
+        pg_config_excerpt(excerpt, sizeof(excerpt), valueLine);
+        if (strchr(valueLine, ',') != NULL) {
+            parsedChunkConfig = pg_parse_chunk_id_list_line(valueLine);
+        } else if (pg_parse_chunk_count_line(valueLine, &chunkCount)) {
             pg_reset_chunk_ids(chunkCount);
             parsedChunkConfig = 1;
         }
-    }
-    if (!parsedChunkConfig) {
+        if (!parsedChunkConfig) {
+            fclose(fp);
+            snprintf(detail, sizeof(detail),
+                "playgo_stub.dat line 1: \"%s\" is not a chunk count or a list of chunk ids", excerpt);
+            pg_config_fatal(detail);
+            return;
+        }
+    } else {
         pg_reset_chunk_ids(kDefaultChunkCount);
     }
 
-    if (fgets(line, sizeof(line), fp) != NULL) {
-        value = pg_strtoul_preserve_errno(line, NULL, 10);
+    valueLine = pg_next_config_value(fp, line, kConfigLineSize);
+    if (valueLine != NULL) {
+        char* end;
+        pg_config_excerpt(excerpt, sizeof(excerpt), valueLine);
+        /*
+         * A typo check, not a range check: pg_scenario_mask_all documents
+         * support for counts far above SCE_PLAYGO_MAX_SCENARIO, so the only
+         * thing rejected here is a line that is not a plain number.
+         */
+        value = pg_strtoul_preserve_errno(valueLine, &end, 10);
+        if (end == valueLine || *end != '\0' || value > 0xFFFFFFFFul) {
+            fclose(fp);
+            snprintf(detail, sizeof(detail),
+                "playgo_stub.dat line 2: \"%s\" is not a scenario count", excerpt);
+            pg_config_fatal(detail);
+            return;
+        }
         g_playgo.scenario_count = (uint32_t)value;
     }
 
-    if (fgets(line, sizeof(line), fp) != NULL) {
-        if (pg_parse_language_config_line(line, &languageMask)) {
-            g_playgo.available_language_mask = languageMask;
-            g_playgo.language_mask = languageMask;
+    valueLine = pg_next_config_value(fp, line, kConfigLineSize);
+    if (valueLine != NULL) {
+        pg_config_excerpt(excerpt, sizeof(excerpt), valueLine);
+        if (pg_parse_language_config_line(valueLine, &languageMask, badToken, sizeof(badToken))) {
+            parsedLanguageConfig = 1;
         } else {
-            pg_logf("config: invalid language configuration, using all languages");
+            fclose(fp);
+            if (badToken[0] != '\0') {
+                snprintf(detail, sizeof(detail),
+                    "playgo_stub.dat line 3: \"%s\" is not a language name", badToken);
+            } else {
+                snprintf(detail, sizeof(detail),
+                    "playgo_stub.dat line 3: \"%s\" is not a language list, a 0x... mask, or \"all\"", excerpt);
+            }
+            pg_config_fatal(detail);
+            return;
+        }
+    }
+
+    valueLine = pg_next_config_value(fp, line, kConfigLineSize);
+    if (valueLine != NULL) {
+        pg_config_excerpt(excerpt, sizeof(excerpt), valueLine);
+        if (!pg_parse_console_fallback_line(valueLine, &consoleFallback)) {
+            fclose(fp);
+            snprintf(detail, sizeof(detail),
+                "playgo_stub.dat line 4: \"%s\" is not 0 or 1", excerpt);
+            pg_config_fatal(detail);
+            return;
         }
     }
 
     fclose(fp);
+
+    if (parsedLanguageConfig) {
+        g_playgo.language_mask = languageMask;
+        g_playgo.available_language_mask = languageMask;
+    }
+
+    /*
+     * Opt-in only: the console system language is queried at all only when the
+     * config file asks for it, and it widens the supported set without ever
+     * touching the installed set reported by scePlayGoGetLanguageMask.
+     */
+    g_playgo.console_language_fallback = consoleFallback;
+    if (consoleFallback) {
+        int32_t consoleLang = -1;
+        ScePlayGoLanguageMask consoleBit = pg_console_language_bit(&consoleLang);
+        pg_logf("config: console_language=%d console_bit=0x%016llx", consoleLang, (unsigned long long)consoleBit);
+        g_playgo.available_language_mask |= consoleBit;
+    }
+
     g_playgo.config_loaded_from_file = 1;
-    pg_logf("config: loaded chunk_count=%u scenario_count=%u available_language_mask=0x%016llx current_language_mask=0x%016llx",
+    pg_logf("config: loaded chunk_count=%u scenario_count=%u available_language_mask=0x%016llx current_language_mask=0x%016llx console_language_fallback=%d",
         g_playgo.chunk_count,
         g_playgo.scenario_count,
         (unsigned long long)g_playgo.available_language_mask,
-        (unsigned long long)g_playgo.language_mask);
+        (unsigned long long)g_playgo.language_mask,
+        g_playgo.console_language_fallback);
 }
 
 /*
@@ -537,6 +954,23 @@ static int32_t pg_validate_chunk_list(const ScePlayGoChunkId* chunkIds, uint32_t
 }
 
 /*
+ * Return a scenario bitmask with all configured scenarios enabled.
+ *
+ * Scenario masks are 64-bit wide in the ABI. When the configuration says there
+ * are more than 64 scenarios, the stub reports all 64 bits set because that is
+ * the maximum representable value in the public API.
+ */
+static uint64_t pg_scenario_mask_all(void) {
+    if (g_playgo.scenario_count >= 64) {
+        return ~0ULL;
+    }
+    if (g_playgo.scenario_count == 0) {
+        return 0ULL;
+    }
+    return (1ULL << g_playgo.scenario_count) - 1ULL;
+}
+
+/*
  * Shared implementation for GetChunkId/GetInstallChunkId style APIs.
  *
  * The helper follows the usual PlayGo list-query pattern:
@@ -605,14 +1039,20 @@ extern "C" {
 
         pg_set_defaults();
         pg_load_config();
+        if (g_playgo.config_error) {
+            rc = SCE_PLAYGO_ERROR_FATAL;
+            pg_logf("scePlayGoInitialize rc=%d config_error=1", rc);
+            return rc;
+        }
         g_playgo.initialized = 1;
-        pg_logf("scePlayGoInitialize rc=0 version=%s chunk_count=%u scenario_count=%u config_source=%s available_language_mask=0x%016llx current_language_mask=0x%016llx install_speed=%d",
+        pg_logf("scePlayGoInitialize rc=0 version=%s chunk_count=%u scenario_count=%u config_source=%s available_language_mask=0x%016llx current_language_mask=0x%016llx console_language_fallback=%d install_speed=%d",
             kPlayGoStubVersion,
             g_playgo.chunk_count,
             g_playgo.scenario_count,
             g_playgo.config_loaded_from_file ? "file" : "defaults",
             (unsigned long long)g_playgo.available_language_mask,
             (unsigned long long)g_playgo.language_mask,
+            g_playgo.console_language_fallback,
             g_playgo.install_speed);
         return SCE_OK;
     }

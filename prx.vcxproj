@@ -82,7 +82,7 @@
       <CLanguageStd>C17</CLanguageStd>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>libkernel_stub_weak.a;$(OutDir)libSceLibcInternal_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libkernel_stub_weak.a;$(OutDir)libSceLibcInternal_stub_weak.a;$(OutDir)libSceIpmi_stub_weak.a;libSceSystemService_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>-Wl,--as-needed %(AdditionalOptions)</AdditionalOptions>
       <ImportLibrary>libScePlayGo.prx</ImportLibrary>
       <DataStripping>true</DataStripping>
@@ -107,7 +107,7 @@ if exist "$(ProjectDir)\libSceLibcInternal.sprx" copy /Y "$(ProjectDir)\libSceLi
       <CLanguageStd>C17</CLanguageStd>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>libkernel_stub_weak.a;$(OutDir)libSceLibcInternal_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libkernel_stub_weak.a;$(OutDir)libSceLibcInternal_stub_weak.a;$(OutDir)libSceIpmi_stub_weak.a;libSceSystemService_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>-Wl,--as-needed %(AdditionalOptions)</AdditionalOptions>
       <ImportLibrary>libScePlayGo.prx</ImportLibrary>
       <DataStripping>true</DataStripping>
@@ -132,7 +132,7 @@ if exist "$(ProjectDir)\libSceLibcInternal.sprx" copy /Y "$(ProjectDir)\libSceLi
       <CLanguageStd>C17</CLanguageStd>
     </ClCompile>
     <Link>
-      <AdditionalDependencies>libkernel_stub_weak.a;$(OutDir)libSceLibcInternal_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>libkernel_stub_weak.a;$(OutDir)libSceLibcInternal_stub_weak.a;$(OutDir)libSceIpmi_stub_weak.a;libSceSystemService_stub_weak.a;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalOptions>-Wl,--as-needed %(AdditionalOptions)</AdditionalOptions>
       <ImportLibrary>libScePlayGo.prx</ImportLibrary>
       <DataStripping>true</DataStripping>
@@ -157,6 +157,17 @@ if exist "$(ProjectDir)\libSceLibcInternal.sprx" copy /Y "$(ProjectDir)\libSceLi
           Command="python &quot;$(ProjectDir)tools\make_playgo_libc_internal_stub.py&quot; --out &quot;$(OutDir)libSceLibcInternal_stub_weak.a&quot;" />
     <ItemGroup>
       <FileWrites Include="$(OutDir)libSceLibcInternal_stub_weak.a" />
+    </ItemGroup>
+  </Target>
+  <Target Name="GeneratePlayGoIpmiStub"
+          BeforeTargets="Link"
+          Inputs="$(ProjectDir)tools\make_playgo_libc_internal_stub.py"
+          Outputs="$(OutDir)libSceIpmi_stub_weak.a">
+    <Message Importance="High" Text="Generating $(OutDir)libSceIpmi_stub_weak.a" />
+    <Exec WorkingDirectory="$(ProjectDir)"
+          Command="python &quot;$(ProjectDir)tools\make_playgo_libc_internal_stub.py&quot; --stub ipmi --out &quot;$(OutDir)libSceIpmi_stub_weak.a&quot;" />
+    <ItemGroup>
+      <FileWrites Include="$(OutDir)libSceIpmi_stub_weak.a" />
     </ItemGroup>
   </Target>
   <Target Name="GenerateSignedPlayGoSprx"
