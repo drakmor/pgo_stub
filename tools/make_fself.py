@@ -25,7 +25,7 @@ def ilog2(x):
 	return len(bin(x)) - 3
 
 def is_intervals_overlap(p1, p2):
-	return p1[0] <= p2[1] and p1[1] <= p2[0]
+	return p1[0] <= p2[1] and p2[0] <= p1[1]
 
 def check_file_magic(f, expected_magic):
 	old_offset = f.tell()
@@ -121,13 +121,14 @@ class ElfEHdr(object):
 class ElfPHdr(object):
 	FMT = '<2I6Q'
 
+	PT_NULL = 0x0
 	PT_LOAD = 0x1
 	PT_DYNAMIC = 0x2
 	PT_INTERP = 0x3
 	PT_TLS = 0x7
 	PT_GNU_EH_FRAME = 0x6474E550
 	PT_GNU_STACK = 0x6474E551
-	PT_SCE_RELA = 0x60000000,
+	PT_SCE_RELA = 0x60000000
 	PT_SCE_DYNLIBDATA = 0x61000000
 	PT_SCE_PROCPARAM = 0x61000001
 	PT_SCE_MODULE_PARAM = 0x61000002
@@ -186,6 +187,8 @@ class ElfPHdr(object):
 
 class ElfSHdr(object):
 	FMT = '<2I4Q2I2Q'
+	SHT_NULL = 0
+	SHT_NOBITS = 8
 
 	def __init__(self, idx):
 		self.idx = idx
@@ -217,6 +220,10 @@ class ElfFile(object):
 		self.sections = None
 		self.ignore_shdrs = 'ignore_shdrs' in kwargs and kwargs['ignore_shdrs']
 
+	def _check_range(self, offset, size, description):
+		if offset < 0 or size < 0 or offset > self.file_size or size > self.file_size - offset:
+			raise ElfError('{0} extends beyond the input file.'.format(description))
+
 	def load(self, f):
 		start_offset = f.tell()
 		data = f.read()
@@ -224,8 +231,18 @@ class ElfFile(object):
 		self.digest = sha256(data)
 		f.seek(start_offset)
 
+		if self.file_size < 64:
+			raise ElfError('Truncated ELF header.')
+
 		self.ehdr = ElfEHdr()
 		self.ehdr.load(f)
+		if self.ehdr.ehsize != 64:
+			raise ElfError('Unsupported ELF header size.')
+		self._check_range(self.ehdr.phoff, self.ehdr.phentsize * self.ehdr.phnum, 'Program header table')
+		if not self.ignore_shdrs:
+			if self.ehdr.shnum > 0 and self.ehdr.shentsize != 64:
+				raise ElfError('Unsupported section header entry size.')
+			self._check_range(self.ehdr.shoff, self.ehdr.shentsize * self.ehdr.shnum, 'Section header table')
 
 		if self.ignore_shdrs:
 			self.ehdr.shnum = 0
@@ -238,9 +255,12 @@ class ElfFile(object):
 				phdr = ElfPHdr(i)
 				phdr.load(f)
 				self.phdrs.append(phdr)
-				if phdr.filesz > 0:
+				if phdr.type != ElfPHdr.PT_NULL and phdr.filesz > 0:
+					self._check_range(phdr.offset, phdr.filesz, 'Segment #{0}'.format(i))
 					f.seek(start_offset + phdr.offset)
 					data = f.read(phdr.filesz)
+					if len(data) != phdr.filesz:
+						raise ElfError('Truncated segment #{0}.'.format(i))
 				else:
 					data = b''
 				self.segments.append(data)
@@ -253,11 +273,14 @@ class ElfFile(object):
 				shdr = ElfSHdr(i)
 				shdr.load(f)
 				self.shdrs.append(shdr)
-				if phdr.filesz > 0:
-					f.seek(start_offset + shdr.offset)
-					data = f.read(phdr.filesz)
-				else:
+				if shdr.type in (ElfSHdr.SHT_NULL, ElfSHdr.SHT_NOBITS):
 					data = b''
+				else:
+					self._check_range(shdr.offset, shdr.size, 'Section #{0}'.format(i))
+					f.seek(start_offset + shdr.offset)
+					data = f.read(shdr.size)
+					if len(data) != shdr.size:
+						raise ElfError('Truncated section #{0}.'.format(i))
 				self.sections.append(data)
 
 	def save(self, f, no_sections=False):
@@ -422,24 +445,26 @@ class SignedElfEntry(object):
 	@property
 	def block_size(self):
 		if self.has_blocks:
-			return 1 << (12 + (self.props >> SignedElfEntry.PROPS_BLOCK_SIZE_SHIFT) & SignedElfEntry.PROPS_BLOCK_SIZE_MASK)
+			return 1 << (12 + ((self.props >> SignedElfEntry.PROPS_BLOCK_SIZE_SHIFT) & SignedElfEntry.PROPS_BLOCK_SIZE_MASK))
 		else:
 			return DEFAULT_BLOCK_SIZE
 
 	@block_size.setter
 	def block_size(self, value):
-		self.props &= ~(SignedElfEntry.PROPS_BLOCK_SIZE_MASK << SignedElfEntry.PROPS_BLOCK_SIZE_SHIFT)
 		if self.has_blocks:
+			if value < 0x1000 or value > (1 << (12 + SignedElfEntry.PROPS_BLOCK_SIZE_MASK)) or value & (value - 1):
+				raise ValueError('Block size must be a representable power of two.')
 			value = ilog2(value) - 12
 		else:
 			value = 0 # TODO: check
+		self.props &= ~(SignedElfEntry.PROPS_BLOCK_SIZE_MASK << SignedElfEntry.PROPS_BLOCK_SIZE_SHIFT)
 		self.props |= (value & SignedElfEntry.PROPS_BLOCK_SIZE_MASK) << SignedElfEntry.PROPS_BLOCK_SIZE_SHIFT
 
 	@property
 	def segment_index(self):
 		return (self.props >> SignedElfEntry.PROPS_SEGMENT_INDEX_SHIFT) & SignedElfEntry.PROPS_SEGMENT_INDEX_MASK
 
-	@wbits.setter
+	@segment_index.setter
 	def segment_index(self, value):
 		self.props &= ~(SignedElfEntry.PROPS_SEGMENT_INDEX_MASK << SignedElfEntry.PROPS_SEGMENT_INDEX_SHIFT)
 		self.props |= (value & SignedElfEntry.PROPS_SEGMENT_INDEX_MASK) << SignedElfEntry.PROPS_SEGMENT_INDEX_SHIFT
@@ -784,7 +809,7 @@ if __name__ == '__main__':
         if ptype is None:
             ptype = try_parse_int(args.ptype)
         if ptype is None:
-            parser.error('invalid program type: 0x{0:016X}'.format(ptype))
+            parser.error('invalid program type: {0!r}'.format(args.ptype))
     if not (0 <= ptype <= 0xFFFFFFFFFFFFFFFF):
         parser.error('invalid program type: 0x{0:016X}'.format(ptype))
 
