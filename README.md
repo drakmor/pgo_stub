@@ -15,7 +15,7 @@ The module provides the common PlayGo entry points expected by titles that query
 - Supports an optional runtime config file to adjust the visible chunk layout and available languages.
 - Can optionally write call logs for debugging PlayGo-related behavior.
 
-By default, the stub behaves optimistically: PlayGo is treated as initialized, all languages are available, all scenarios are supported, and installation is complete.
+By default, all languages and the five SDK scenarios are available, and installation is complete. The title must still initialize PlayGo and open a handle.
 
 ## Optional Config
 
@@ -35,7 +35,11 @@ Supported format:
 english_us,russian,english_gb
 ```
 
-The first line is either a chunk count or a comma-separated list of valid chunk IDs. The second line is an optional scenario count. The third line is an optional language configuration, expressed as either:
+The first line is either a chunk count or a comma-separated list of valid chunk IDs. Counts above 65000 are clamped to 65000; zero, negative, overflowing, or malformed counts fall back to 1000 chunks. Physical lines longer than 65535 bytes or containing NUL bytes are discarded as invalid without shifting subsequent fields.
+
+The second line is an optional scenario count from 0 through 5. A count of N enables scenario IDs 0 through N-1; an explicit 0 disables all scenarios. Missing or invalid scenario configuration enables all five scenarios. Optional-chunk queries report this mask, and requests for unavailable scenarios return `SCE_PLAYGO_ERROR_BAD_SCENARIO_CONFIGURATION`.
+
+The third line is an optional language configuration, expressed as either:
 
 - A 64-bit hexadecimal mask with a required `0x` prefix, for example `0x4080200000000000`.
 - A comma-separated list of language names or numeric system-language IDs, for example `english_us,8,english_gb`.
@@ -109,3 +113,15 @@ msbuild libScePlayGo.sln /p:Configuration=ReleaseNoLog /p:Platform=Prospero
 ## Scope
 
 This project is a compatibility stub, not a full PlayGo implementation. It does not download, install, verify, or stream real package data. Its purpose is to satisfy PlayGo API usage with predictable responses so titles can continue running in test, research, or compatibility environments.
+
+### Empty Lists
+
+After successful initialization and opening a valid handle, the stub accepts `numberOfEntries == 0` in these APIs:
+
+- `scePlayGoGetLocus`: returns `SCE_OK` without accessing either array; both arrays may be `NULL`.
+- `scePlayGoSetToDoList`: clears the stub's pending list and returns `SCE_OK`; the input array may be `NULL`.
+- `scePlayGoGetToDoList`: writes `0` to `outEntries` and returns `SCE_OK`; the output array may be `NULL`. `outEntries` remains required.
+
+This is a compatibility extension, not a claim about original SDK behavior. The local original PS5 PlayGo reference checks pointers before the count and rejects counts outside 1..1000 in these APIs.
+
+Nonempty lists retain pointer, size, and chunk validation. Empty lists still require an initialized library and a valid open handle.

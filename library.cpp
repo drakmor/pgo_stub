@@ -8,13 +8,45 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__ORBIS__) || defined(__PROSPERO__)
+#include <sys/_pthreadtypes.h>
+/* Minimal libkernel imports, using the SDK's opaque mutex type. */
+extern "C" {
+    int scePthreadMutexLock(pthread_mutex_t* mutex);
+    int scePthreadMutexUnlock(pthread_mutex_t* mutex);
+    int scePthreadMutexDestroy(pthread_mutex_t* mutex);
+}
+static pthread_mutex_t g_playgo_mutex = NULL;
+static int pg_lock(void) { return scePthreadMutexLock(&g_playgo_mutex); }
+static void pg_unlock(void) { (void)scePthreadMutexUnlock(&g_playgo_mutex); }
+static int pg_destroy_mutex(void) { return scePthreadMutexDestroy(&g_playgo_mutex); }
+#else
+#include <pthread.h>
+static pthread_mutex_t g_playgo_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int pg_lock(void) { return pthread_mutex_lock(&g_playgo_mutex); }
+static void pg_unlock(void) { (void)pthread_mutex_unlock(&g_playgo_mutex); }
+static int pg_destroy_mutex(void) { return pthread_mutex_destroy(&g_playgo_mutex); }
+#endif
+
+/* The mutex lives outside state cleared by Initialize/Terminate. */
+class PlayGoGuard {
+public:
+    PlayGoGuard() : status_(pg_lock()) {}
+    ~PlayGoGuard() { if (status_ == 0) pg_unlock(); }
+    bool locked() const { return status_ == 0; }
+    PlayGoGuard(const PlayGoGuard&) = delete;
+    PlayGoGuard& operator=(const PlayGoGuard&) = delete;
+private:
+    int status_;
+};
+
 #ifndef PLAYGO_ENABLE_LOGGING
 #define PLAYGO_ENABLE_LOGGING 0
 #endif
 
 static constexpr uint32_t kDefaultChunkCount = 1000;
 static constexpr uint32_t kConfigLineSize = 65536;
-static constexpr const char* kPlayGoStubVersion = "0.5";
+static constexpr const char* kPlayGoStubVersion = "0.6";
 
 struct PlayGoState {
     int initialized;
@@ -35,6 +67,8 @@ struct PlayGoState {
 
 static PlayGoState g_playgo;
 static char g_config_line[kConfigLineSize];
+/* Scratch bitset used only while holding the state mutex. */
+static uint8_t g_chunk_seen[(SCE_PLAYGO_CHUNK_INDEX_MAX + 7u) / 8u];
 static const char kConfigWhitespace[] = " \t\r\n\v\f";
 
 static const char* const kLanguageNames[] = {
@@ -100,14 +134,20 @@ static void pg_logf(const char* fmt, ...) { (void)fmt; }
 
 extern "C" {
     int module_start(size_t args, const void* argp) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         pg_log_reset();
         pg_logf("module_start: module loaded version=%s args=%zu argp=%p", kPlayGoStubVersion, args, argp);
         return 0;
     }
 
     int module_stop(size_t args, const void* argp) {
-        pg_logf("module_stop: module unloading args=%zu argp=%p", args, argp);
-        return 0;
+        {
+            PlayGoGuard guard;
+            if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
+            pg_logf("module_stop: module unloading args=%zu argp=%p", args, argp);
+        }
+        return pg_destroy_mutex() == 0 ? SCE_OK : SCE_PLAYGO_ERROR_FATAL;
     }
 }
 
@@ -118,16 +158,16 @@ extern "C" {
  * without requiring a debugger. These helpers keep the per-function log lines
  * short and consistent.
  */
-static unsigned long long pg_optional_mask_value(const ScePlayGoOptionalChunk* option) {
-    return option ? (unsigned long long)option->bitmask : 0ULL;
+static unsigned long long pg_optional_mask_value(int32_t rc, const ScePlayGoOptionalChunk* option) {
+    return (rc == SCE_OK && option != NULL) ? (unsigned long long)option->bitmask : 0ULL;
 }
 
-static unsigned pg_first_chunk_id(const ScePlayGoChunkId* chunkIds, uint32_t numberOfEntries) {
-    return (chunkIds != NULL && numberOfEntries > 0) ? (unsigned)chunkIds[0] : 0u;
+static unsigned pg_first_chunk_id(int32_t rc, const ScePlayGoChunkId* chunkIds, uint32_t numberOfEntries) {
+    return (rc == SCE_OK && chunkIds != NULL && numberOfEntries > 0) ? (unsigned)chunkIds[0] : 0u;
 }
 
-static unsigned pg_last_chunk_id(const ScePlayGoChunkId* chunkIds, uint32_t numberOfEntries) {
-    return (chunkIds != NULL && numberOfEntries > 0) ? (unsigned)chunkIds[numberOfEntries - 1] : 0u;
+static unsigned pg_last_chunk_id(int32_t rc, const ScePlayGoChunkId* chunkIds, uint32_t numberOfEntries) {
+    return (rc == SCE_OK && chunkIds != NULL && numberOfEntries > 0) ? (unsigned)chunkIds[numberOfEntries - 1] : 0u;
 }
 
 static unsigned pg_log_bad_chunk_id(int32_t rc, ScePlayGoChunkId badChunkId) {
@@ -182,19 +222,28 @@ static void pg_reset_chunk_ids(uint32_t chunkCount) {
     }
 }
 
-static unsigned long pg_strtoul_preserve_errno(const char* text, char** end, int base) {
+static int pg_parse_unsigned_decimal(const char* text, char** end, unsigned long* outValue) {
+    text += strspn(text, kConfigWhitespace);
+    if (*text < '0' || *text > '9') {
+        return 0;
+    }
     int savedErrno = errno;
-    unsigned long value = strtoul(text, end, base);
+    errno = 0;
+    unsigned long value = strtoul(text, end, 10);
+    int parseErrno = errno;
     errno = savedErrno;
-    return value;
+    if (*end == text || parseErrno == ERANGE) {
+        return 0;
+    }
+    *outValue = value;
+    return 1;
 }
 
 static int pg_parse_chunk_count_line(const char* line, uint32_t* outChunkCount) {
     char* end;
     unsigned long value;
 
-    value = pg_strtoul_preserve_errno(line, &end, 10);
-    if (end == line || value == 0) {
+    if (!pg_parse_unsigned_decimal(line, &end, &value) || value == 0) {
         return 0;
     }
     end += strspn(end, kConfigWhitespace);
@@ -205,6 +254,20 @@ static int pg_parse_chunk_count_line(const char* line, uint32_t* outChunkCount) 
         value = SCE_PLAYGO_CHUNK_INDEX_MAX;
     }
     *outChunkCount = (uint32_t)value;
+    return 1;
+}
+
+static int pg_parse_scenario_count_line(const char* line, uint32_t* outCount) {
+    char* end;
+    unsigned long value;
+    if (!pg_parse_unsigned_decimal(line, &end, &value) || value > SCE_PLAYGO_MAX_SCENARIO) {
+        return 0;
+    }
+    end += strspn(end, kConfigWhitespace);
+    if (*end != '\0') {
+        return 0;
+    }
+    *outCount = (uint32_t)value;
     return 1;
 }
 
@@ -224,8 +287,8 @@ static int pg_parse_chunk_id_list_line(char* line) {
             break;
         }
 
-        unsigned long value = pg_strtoul_preserve_errno(cursor, &end, 10);
-        if (end == cursor || value >= SCE_PLAYGO_CHUNK_INDEX_MAX) {
+        unsigned long value;
+        if (!pg_parse_unsigned_decimal(cursor, &end, &value) || value >= SCE_PLAYGO_CHUNK_INDEX_MAX) {
             return 0;
         }
         if (!pg_add_chunk_id((ScePlayGoChunkId)value)) {
@@ -261,8 +324,7 @@ static int pg_parse_language_id(char* token, int32_t* outSystemLanguage) {
     size_t i;
 
     if (token[0] >= '0' && token[0] <= '9') {
-        value = pg_strtoul_preserve_errno(token, &end, 10);
-        if (*end != '\0' || value >= 48u) {
+        if (!pg_parse_unsigned_decimal(token, &end, &value) || *end != '\0' || value >= 48u) {
             return 0;
         }
         *outSystemLanguage = (int32_t)value;
@@ -331,9 +393,8 @@ static int pg_parse_language_config_line(char* line, ScePlayGoLanguageMask* outM
 /*
  * Reset the whole global stub state to defaults.
  *
- * Defaults are intentionally optimistic: the library behaves as if PlayGo is
- * fully initialized, all languages are available, all scenarios are available,
- * and installation is already complete. The title can continue running even when the real PlayGo service is missing.
+ * Defaults make all languages and scenarios available and installation complete.
+ * The caller must still initialize the library and open a handle.
  */
 static void pg_set_defaults(void) {
     memset(&g_playgo, 0, sizeof(g_playgo));
@@ -341,7 +402,7 @@ static void pg_set_defaults(void) {
     g_playgo.install_speed = SCE_PLAYGO_INSTALL_SPEED_TRICKLE;
     g_playgo.language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
     g_playgo.available_language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
-    g_playgo.scenario_count = 0;
+    g_playgo.scenario_count = SCE_PLAYGO_MAX_SCENARIO;
     g_playgo.config_loaded_from_file = 0;
     pg_reset_chunk_ids(kDefaultChunkCount);
 }
@@ -360,16 +421,43 @@ static void pg_set_defaults(void) {
  * package exposes ids 0..999 and reports BAD_CHUNK_ID for 1000. If line 1
  * contains commas, it is treated as the exact valid chunk id list instead.
  */
+/* Read one physical line; discard oversized or NUL-containing lines. */
+static int pg_read_config_line(FILE* fp) {
+    size_t length = 0;
+    int invalid = 0;
+    int ch;
+    while ((ch = fgetc(fp)) != EOF) {
+        if (ch == '\0') {
+            invalid = 1;
+        }
+        if (length < sizeof(g_config_line) - 1) {
+            g_config_line[length++] = (char)ch;
+        } else {
+            invalid = 1;
+        }
+        if (ch == '\n') {
+            break;
+        }
+    }
+    g_config_line[length] = '\0';
+    if (ferror(fp)) {
+        return -1;
+    }
+    if (length == 0 && ch == EOF) {
+        return 0;
+    }
+    return invalid ? -1 : 1;
+}
+
 static void pg_load_config(void) {
     FILE* fp;
     char* line = g_config_line;
-    unsigned long value;
     uint32_t chunkCount;
     int parsedChunkConfig = 0;
     ScePlayGoLanguageMask languageMask;
 
     pg_reset_chunk_ids(kDefaultChunkCount);
-    g_playgo.scenario_count = 0;
+    g_playgo.scenario_count = SCE_PLAYGO_MAX_SCENARIO;
     g_playgo.language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
     g_playgo.available_language_mask = SCE_PLAYGO_LANGUAGE_MASK_ALL;
     g_playgo.config_loaded_from_file = 0;
@@ -384,7 +472,7 @@ static void pg_load_config(void) {
         return;
     }
 
-    if (fgets(line, sizeof(line), fp) != NULL) {
+    if (pg_read_config_line(fp) == 1) {
         if (strchr(line, ',') != NULL) {
             parsedChunkConfig = pg_parse_chunk_id_list_line(line);
         } else if (pg_parse_chunk_count_line(line, &chunkCount)) {
@@ -396,12 +484,11 @@ static void pg_load_config(void) {
         pg_reset_chunk_ids(kDefaultChunkCount);
     }
 
-    if (fgets(line, sizeof(line), fp) != NULL) {
-        value = pg_strtoul_preserve_errno(line, NULL, 10);
-        g_playgo.scenario_count = (uint32_t)value;
+    if (pg_read_config_line(fp) == 1) {
+        (void)pg_parse_scenario_count_line(line, &g_playgo.scenario_count);
     }
 
-    if (fgets(line, sizeof(line), fp) != NULL) {
+    if (pg_read_config_line(fp) == 1) {
         if (pg_parse_language_config_line(line, &languageMask)) {
             g_playgo.available_language_mask = languageMask;
             g_playgo.language_mask = languageMask;
@@ -452,6 +539,20 @@ static int pg_valid_count(uint32_t count) {
     return count > 0 && count <= SCE_PLAYGO_CHUNK_INDEX_MAX;
 }
 
+static int pg_valid_locus(ScePlayGoLocus locus) {
+    return locus == SCE_PLAYGO_LOCUS_NOT_DOWNLOADED ||
+        locus == SCE_PLAYGO_LOCUS_LOCAL_SLOW || locus == SCE_PLAYGO_LOCUS_LOCAL_FAST;
+}
+
+/* Call only after validating the id's range. */
+static int pg_mark_chunk_seen(ScePlayGoChunkId id) {
+    uint8_t mask = (uint8_t)(1u << (id & 7u));
+    uint8_t* bits = &g_chunk_seen[id >> 3];
+    if ((*bits & mask) != 0) return 0;
+    *bits |= mask;
+    return 1;
+}
+
 /*
  * Validate optional chunk selector type.
  */
@@ -464,14 +565,34 @@ static int pg_language_mask_is_available(ScePlayGoLanguageMask languageMask) {
     return (languageMask & ~g_playgo.available_language_mask) == 0;
 }
 
-static int32_t pg_validate_optional_language_mask(
+static ScePlayGoScenarioMask pg_available_scenario_mask(void) {
+    return (1ULL << g_playgo.scenario_count) - 1ULL;
+}
+
+static int32_t pg_validate_optional_mask(
     ScePlayGoOptionalChunkType type,
     const ScePlayGoOptionalChunk* option) {
     if (type == SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_LANGUAGE &&
         !pg_language_mask_is_available(option->languages)) {
         return SCE_PLAYGO_ERROR_BAD_LANG_CONFIGURATION;
     }
+    if (type == SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_SCENARIO &&
+        (option->scenarios & ~pg_available_scenario_mask()) != 0) {
+        return SCE_PLAYGO_ERROR_BAD_SCENARIO_CONFIGURATION;
+    }
     return SCE_OK;
+}
+
+/* Called with the state mutex held by either optional-request export. */
+static int32_t pg_request_optional_chunk(ScePlayGoHandle handle,
+    ScePlayGoOptionalChunkType type, const ScePlayGoOptionalChunk* option) {
+    int32_t rc = pg_require_initialized();
+    if (rc != SCE_OK) return rc;
+    rc = pg_require_handle(handle);
+    if (rc != SCE_OK) return rc;
+    if (option == NULL) return SCE_PLAYGO_ERROR_BAD_POINTER;
+    if (!pg_valid_optional_type(type)) return SCE_PLAYGO_ERROR_BAD_OPTIONAL_TYPE;
+    return pg_validate_optional_mask(type, option);
 }
 
 /*
@@ -502,6 +623,7 @@ static int32_t pg_validate_chunk_list(const ScePlayGoChunkId* chunkIds, uint32_t
         return SCE_PLAYGO_ERROR_BAD_SIZE;
     }
 
+    memset(g_chunk_seen, 0, sizeof(g_chunk_seen));
     for (i = 0; i < numberOfEntries; ++i) {
         ScePlayGoChunkId id = chunkIds[i];
         if ((uint32_t)id >= SCE_PLAYGO_CHUNK_INDEX_MAX) {
@@ -530,6 +652,11 @@ static int32_t pg_validate_chunk_list(const ScePlayGoChunkId* chunkIds, uint32_t
                 *outBadChunkId = id;
             }
             return SCE_PLAYGO_ERROR_PROHIBIT_CHUNK_ID;
+        }
+        if (!pg_mark_chunk_seen(id)) {
+            if (outBadIndex != NULL) *outBadIndex = i;
+            if (outBadChunkId != NULL) *outBadChunkId = id;
+            return SCE_PLAYGO_ERROR_BAD_CHUNK_ID;
         }
     }
 
@@ -588,6 +715,8 @@ extern "C" {
      * returns SCE_OK.
      */
     PRX_INTERFACE int32_t scePlayGoInitialize(const ScePlayGoInitParams* initParam) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc;
         if (g_playgo.initialized) {
             rc = SCE_PLAYGO_ERROR_ALREADY_INITIALIZED;
@@ -624,6 +753,8 @@ extern "C" {
      * lifecycle contract of the original API without involving any real backend.
      */
     PRX_INTERFACE int32_t scePlayGoTerminate(void) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) {
             pg_logf("scePlayGoTerminate rc=%d", rc);
@@ -642,6 +773,8 @@ extern "C" {
      * sample code that passes NULL.
      */
     PRX_INTERFACE int32_t scePlayGoOpen(ScePlayGoHandle* outHandle, const void* param) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         (void)param;
         if (rc != SCE_OK) {
@@ -667,6 +800,8 @@ extern "C" {
      * backend service involved.
      */
     PRX_INTERFACE int32_t scePlayGoClose(ScePlayGoHandle handle) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) {
             pg_logf("scePlayGoClose rc=%d handle=%d", rc, handle);
@@ -687,12 +822,14 @@ extern "C" {
     /*
      * Report the locus of each requested chunk.
      *
-     * This follows the observed validation pattern of the original wrapper:
-     * the number of requested entries must be a valid API list size, and every
-     * chunk id must be in the configured package set. Valid chunks are reported
-     * as already available locally at fast speed.
+     * Empty lists are accepted as a compatibility extension to the original
+     * wrapper, which requires non-NULL arrays and a positive count. Nonempty
+     * lists still require valid buffers and chunk ids in the configured package
+     * set. Valid chunks are reported as already available locally at fast speed.
      */
     PRX_INTERFACE int32_t scePlayGoGetLocus(ScePlayGoHandle handle, const ScePlayGoChunkId* chunkIds, uint32_t numberOfEntries, ScePlayGoLocus* outLoci) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         uint32_t badIndex = 0;
         ScePlayGoChunkId badChunkId = 0;
@@ -700,8 +837,8 @@ extern "C" {
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
         if (rc != SCE_OK) goto done;
-        if (chunkIds == NULL || outLoci == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
         if (numberOfEntries == 0) { rc = SCE_OK; goto done; }
+        if (chunkIds == NULL || outLoci == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
         rc = pg_validate_chunk_list(chunkIds, numberOfEntries, &badIndex, &badChunkId);
         if (rc != SCE_OK) goto done;
         for (uint32_t i = 0; i < numberOfEntries; ++i) {
@@ -713,8 +850,8 @@ extern "C" {
             rc,
             handle,
             numberOfEntries,
-            pg_first_chunk_id(chunkIds, numberOfEntries),
-            pg_last_chunk_id(chunkIds, numberOfEntries),
+            pg_first_chunk_id(rc, chunkIds, numberOfEntries),
+            pg_last_chunk_id(rc, chunkIds, numberOfEntries),
             (rc == SCE_OK && outLoci != NULL && numberOfEntries > 0) ? outLoci[0] : -1,
             pg_log_bad_chunk_id(rc, badChunkId),
             pg_log_bad_chunk_index(rc, badIndex),
@@ -728,22 +865,34 @@ extern "C" {
      * Titles may use this API as part of their normal PlayGo bookkeeping. In this
      * stub implementation all content is already available, so the request is only
      * validated and then discarded. Subsequent GetToDoList calls therefore still
-     * report an empty list.
+     * report an empty list. An empty input list also clears pending work and may
+     * be NULL, as a compatibility extension to the original wrapper.
      */
     PRX_INTERFACE int32_t scePlayGoSetToDoList(ScePlayGoHandle handle, const ScePlayGoToDo* todoList, uint32_t numberOfEntries) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         uint32_t badIndex = 0;
         ScePlayGoChunkId badChunkId = 0;
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
         if (rc != SCE_OK) goto done;
+        if (numberOfEntries == 0) {
+            g_playgo.todo_count = 0;
+            rc = SCE_OK;
+            goto done;
+        }
         if (todoList == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
         if (!pg_valid_count(numberOfEntries)) { rc = SCE_PLAYGO_ERROR_BAD_SIZE; goto done; }
+        memset(g_chunk_seen, 0, sizeof(g_chunk_seen));
         for (uint32_t i = 0; i < numberOfEntries; ++i) {
             ScePlayGoChunkId id = todoList[i].chunkId;
             if (id >= (ScePlayGoChunkId)SCE_PLAYGO_CHUNK_INDEX_MAX) { badIndex = i; badChunkId = id; rc = SCE_PLAYGO_ERROR_BAD_CHUNK_ID; goto done; }
             if ((uint32_t)id > g_playgo.max_chunk_id) { badIndex = i; badChunkId = id; rc = SCE_PLAYGO_ERROR_BAD_CHUNK_ID; goto done; }
             if (!g_playgo.chunk_valid[id]) { badIndex = i; badChunkId = id; rc = SCE_PLAYGO_ERROR_PROHIBIT_CHUNK_ID; goto done; }
+            if (!pg_mark_chunk_seen(id)) { badIndex = i; badChunkId = id; rc = SCE_PLAYGO_ERROR_BAD_CHUNK_ID; goto done; }
+            if (!pg_valid_locus(todoList[i].locus)) { rc = SCE_PLAYGO_ERROR_BAD_LOCUS; goto done; }
+            if (todoList[i].reserved != 0) { rc = SCE_PLAYGO_ERROR_INVALID_ARGUMENT; goto done; }
         }
         g_playgo.todo_count = 0;
         rc = SCE_OK;
@@ -752,8 +901,8 @@ extern "C" {
             rc,
             handle,
             numberOfEntries,
-            (todoList != NULL && numberOfEntries > 0) ? (unsigned)todoList[0].chunkId : 0u,
-            (todoList != NULL && numberOfEntries > 0) ? todoList[0].locus : -1,
+            (rc == SCE_OK && todoList != NULL && numberOfEntries > 0) ? (unsigned)todoList[0].chunkId : 0u,
+            (rc == SCE_OK && todoList != NULL && numberOfEntries > 0) ? todoList[0].locus : -1,
             g_playgo.todo_count,
             pg_log_bad_chunk_id(rc, badChunkId),
             pg_log_bad_chunk_index(rc, badIndex));
@@ -764,15 +913,19 @@ extern "C" {
      * Return an empty todo list.
      *
      * In this stub there is never any remaining installation work. The function
-     * still validates its output buffers so callers using the official API pattern
-     * continue to behave as expected.
+     * accepts a NULL array when its capacity is zero as a compatibility extension.
+     * The scalar outEntries output remains mandatory, including for empty lists.
      */
     PRX_INTERFACE int32_t scePlayGoGetToDoList(ScePlayGoHandle handle, ScePlayGoToDo* outTodoList, uint32_t numberOfEntries, uint32_t* outEntries) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
         if (rc != SCE_OK) goto done;
-        if (outTodoList == NULL || outEntries == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
+        if (outEntries == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
+        if (numberOfEntries == 0) { *outEntries = 0; rc = SCE_OK; goto done; }
+        if (outTodoList == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
         if (!pg_valid_count(numberOfEntries)) { rc = SCE_PLAYGO_ERROR_BAD_SIZE; goto done; }
         *outEntries = 0;
         rc = SCE_OK;
@@ -788,6 +941,8 @@ extern "C" {
      * requests freely without triggering background work or additional validation.
      */
     PRX_INTERFACE int32_t scePlayGoPrefetch(ScePlayGoHandle handle, const ScePlayGoChunkId* chunkIds, uint32_t numberOfEntries, ScePlayGoLocus minimumLocus) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         uint32_t badIndex = 0;
         ScePlayGoChunkId badChunkId = 0;
@@ -798,14 +953,15 @@ extern "C" {
             rc = pg_validate_chunk_list(chunkIds, numberOfEntries, &badIndex, &badChunkId);
             if (rc != SCE_OK) goto done;
         }
+        if (!pg_valid_locus(minimumLocus)) { rc = SCE_PLAYGO_ERROR_BAD_LOCUS; goto done; }
         rc = SCE_OK;
     done:
         pg_logf("scePlayGoPrefetch rc=%d handle=%d entries=%u first_chunk=%u last_chunk=%u minimum_locus=%d bad_chunk=%u bad_index=%u",
             rc,
             handle,
             numberOfEntries,
-            pg_first_chunk_id(chunkIds, numberOfEntries),
-            pg_last_chunk_id(chunkIds, numberOfEntries),
+            pg_first_chunk_id(rc, chunkIds, numberOfEntries),
+            pg_last_chunk_id(rc, chunkIds, numberOfEntries),
             minimumLocus,
             pg_log_bad_chunk_id(rc, badChunkId),
             pg_log_bad_chunk_index(rc, badIndex));
@@ -818,6 +974,8 @@ extern "C" {
      * The stub always reports that nothing remains to be installed, so ETA is 0.
      */
     PRX_INTERFACE int32_t scePlayGoGetEta(ScePlayGoHandle handle, const ScePlayGoChunkId* chunkIds, uint32_t numberOfEntries, ScePlayGoEta* outEta) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         uint32_t badIndex = 0;
         ScePlayGoChunkId badChunkId = 0;
@@ -836,7 +994,7 @@ extern "C" {
             rc,
             handle,
             numberOfEntries,
-            pg_first_chunk_id(chunkIds, numberOfEntries),
+            pg_first_chunk_id(rc, chunkIds, numberOfEntries),
             (long long)((rc == SCE_OK && outEta != NULL) ? *outEta : -1),
             pg_log_bad_chunk_id(rc, badChunkId),
             pg_log_bad_chunk_index(rc, badIndex));
@@ -850,6 +1008,8 @@ extern "C" {
      * installation scheduling happens.
      */
     PRX_INTERFACE int32_t scePlayGoSetInstallSpeed(ScePlayGoHandle handle, ScePlayGoInstallSpeed speed) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
@@ -866,6 +1026,8 @@ extern "C" {
      * Return the current install speed remembered by the stub.
      */
     PRX_INTERFACE int32_t scePlayGoGetInstallSpeed(ScePlayGoHandle handle, ScePlayGoInstallSpeed* speed) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
@@ -885,6 +1047,8 @@ extern "C" {
      * configuration.
      */
     PRX_INTERFACE int32_t scePlayGoSetLanguageMask(ScePlayGoHandle handle, ScePlayGoLanguageMask languageMask) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
@@ -904,6 +1068,8 @@ extern "C" {
      * Return the current language mask.
      */
     PRX_INTERFACE int32_t scePlayGoGetLanguageMask(ScePlayGoHandle handle, ScePlayGoLanguageMask* outLanguageMask) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
@@ -923,6 +1089,8 @@ extern "C" {
      * care whether installation finished will treat 100/100 as complete.
      */
     PRX_INTERFACE int32_t scePlayGoGetProgress(ScePlayGoHandle handle, const ScePlayGoChunkId* chunkIds, uint32_t numberOfEntries, ScePlayGoProgress* outProgress) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         uint32_t badIndex = 0;
         ScePlayGoChunkId badChunkId = 0;
@@ -942,7 +1110,7 @@ extern "C" {
             rc,
             handle,
             numberOfEntries,
-            pg_first_chunk_id(chunkIds, numberOfEntries),
+            pg_first_chunk_id(rc, chunkIds, numberOfEntries),
             (unsigned long long)((rc == SCE_OK && outProgress != NULL) ? outProgress->progressSize : 0ULL),
             (unsigned long long)((rc == SCE_OK && outProgress != NULL) ? outProgress->totalSize : 0ULL),
             pg_log_bad_chunk_id(rc, badChunkId),
@@ -958,6 +1126,8 @@ extern "C" {
      * then allocate storage and call again to receive the configured chunk ids.
      */
     PRX_INTERFACE int32_t scePlayGoGetChunkId(ScePlayGoHandle handle, ScePlayGoChunkId* outChunkIdList, uint32_t numberOfEntries, uint32_t* outEntries) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) {
             pg_logf("scePlayGoGetChunkId rc=%d handle=%d request_entries=%u returned_entries=%u first_chunk=%u last_chunk=%u", rc, handle, numberOfEntries, (rc == SCE_OK && outEntries != NULL) ? *outEntries : 0u, (rc == SCE_OK && outChunkIdList != NULL && outEntries != NULL && *outEntries > 0) ? (unsigned)outChunkIdList[0] : 0u, (rc == SCE_OK && outChunkIdList != NULL && outEntries != NULL && *outEntries > 0) ? (unsigned)outChunkIdList[*outEntries - 1] : 0u);
@@ -976,10 +1146,12 @@ extern "C" {
     /*
      * Return the currently available optional chunk set.
      *
-     * Language queries return the active language selection. Other optional chunk
-     * categories retain the permissive all-bits-set behavior.
+     * Language queries return the active language selection. Scenario queries use the configured scenario mask;
+     * the observed reserved category retains the all-bits-set behavior.
      */
     PRX_INTERFACE int32_t scePlayGoGetOptionalChunk(ScePlayGoHandle handle, ScePlayGoOptionalChunkType type, ScePlayGoOptionalChunk* option) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
@@ -988,7 +1160,7 @@ extern "C" {
         if (!pg_valid_optional_type(type)) { rc = SCE_PLAYGO_ERROR_BAD_OPTIONAL_TYPE; goto done; }
         option->bitmask = (type == SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_LANGUAGE)
             ? g_playgo.language_mask
-            : ~0ULL;
+            : (type == SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_SCENARIO ? pg_available_scenario_mask() : ~0ULL);
         rc = SCE_OK;
     done:
         pg_logf("scePlayGoGetOptionalChunk rc=%d handle=%d type=%d value=0x%016llx", rc, handle, type, (unsigned long long)((rc == SCE_OK && option != NULL) ? option->bitmask : 0ULL));
@@ -1002,17 +1174,10 @@ extern "C" {
      * requested optional chunks are already available.
      */
     PRX_INTERFACE int32_t scePlayGoPrefetchOptionalChunk(ScePlayGoHandle handle, ScePlayGoOptionalChunkType type, const ScePlayGoOptionalChunk* option) {
-        int32_t rc = pg_require_initialized();
-        if (rc != SCE_OK) goto done;
-        rc = pg_require_handle(handle);
-        if (rc != SCE_OK) goto done;
-        if (option == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
-        if (!pg_valid_optional_type(type)) { rc = SCE_PLAYGO_ERROR_BAD_OPTIONAL_TYPE; goto done; }
-        rc = pg_validate_optional_language_mask(type, option);
-        if (rc != SCE_OK) goto done;
-        rc = SCE_OK;
-    done:
-        pg_logf("scePlayGoPrefetchOptionalChunk rc=%d handle=%d type=%d requested=0x%016llx", rc, handle, type, pg_optional_mask_value(option));
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
+        int32_t rc = pg_request_optional_chunk(handle, type, option);
+        pg_logf("scePlayGoPrefetchOptionalChunk rc=%d handle=%d type=%d requested=0x%016llx", rc, handle, type, pg_optional_mask_value(rc, option));
         return rc;
     }
 
@@ -1024,6 +1189,8 @@ extern "C" {
      * pattern as GetChunkId is used here so callers can probe for the size first.
      */
     PRX_INTERFACE int32_t scePlayGoGetInstallChunkId(ScePlayGoHandle handle, ScePlayGoChunkId* outChunkIdList, uint32_t numberOfEntries, uint32_t* outEntries) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) {
             pg_logf("scePlayGoGetInstallChunkId rc=%d handle=%d request_entries=%u returned_entries=%u first_chunk=%u last_chunk=%u", rc, handle, numberOfEntries, (rc == SCE_OK && outEntries != NULL) ? *outEntries : 0u, (rc == SCE_OK && outChunkIdList != NULL && outEntries != NULL && *outEntries > 0) ? (unsigned)outChunkIdList[0] : 0u, (rc == SCE_OK && outChunkIdList != NULL && outEntries != NULL && *outEntries > 0) ? (unsigned)outChunkIdList[*outEntries - 1] : 0u);
@@ -1042,10 +1209,12 @@ extern "C" {
     /*
      * Return which optional chunks are supported by the title.
      *
-     * Language queries return the configured availability boundary. Other optional
-     * chunk categories retain the permissive all-bits-set behavior.
+     * Language queries return the configured availability boundary. Scenario queries use the configured
+     * scenario mask; the observed reserved category retains all bits set.
      */
     PRX_INTERFACE int32_t scePlayGoGetSupportedOptionalChunk(ScePlayGoHandle handle, ScePlayGoOptionalChunkType type, ScePlayGoOptionalChunk* option) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
@@ -1054,7 +1223,7 @@ extern "C" {
         if (!pg_valid_optional_type(type)) { rc = SCE_PLAYGO_ERROR_BAD_OPTIONAL_TYPE; goto done; }
         option->bitmask = (type == SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_LANGUAGE)
             ? g_playgo.available_language_mask
-            : ~0ULL;
+            : (type == SCE_PLAYGO_OPTIONAL_CHUNK_TYPE_SCENARIO ? pg_available_scenario_mask() : ~0ULL);
         rc = SCE_OK;
     done:
         pg_logf("scePlayGoGetSupportedOptionalChunk rc=%d handle=%d type=%d value=0x%016llx", rc, handle, type, (unsigned long long)((rc == SCE_OK && option != NULL) ? option->bitmask : 0ULL));
@@ -1067,8 +1236,10 @@ extern "C" {
      * This shares the same no-op success behavior as PrefetchOptionalChunk.
      */
     PRX_INTERFACE int32_t scePlayGoRequestOptionalChunk(ScePlayGoHandle handle, ScePlayGoOptionalChunkType type, const ScePlayGoOptionalChunk* option) {
-        int32_t rc = scePlayGoPrefetchOptionalChunk(handle, type, option);
-        pg_logf("scePlayGoRequestOptionalChunk rc=%d handle=%d type=%d requested=0x%016llx", rc, handle, type, pg_optional_mask_value(option));
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
+        int32_t rc = pg_request_optional_chunk(handle, type, option);
+        pg_logf("scePlayGoRequestOptionalChunk rc=%d handle=%d type=%d requested=0x%016llx", rc, handle, type, pg_optional_mask_value(rc, option));
         return rc;
     }
 
@@ -1078,6 +1249,8 @@ extern "C" {
      * The stub only validates that reserved is NULL and then returns success.
      */
     PRX_INTERFACE int32_t scePlayGoRequestNextChunk(ScePlayGoHandle handle, const void* reserved) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
@@ -1097,6 +1270,8 @@ extern "C" {
      * file in /app0 and then writing a short human-readable summary there.
      */
     PRX_INTERFACE int32_t scePlayGoSnapshot(ScePlayGoHandle handle, const char* filename) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         const char* resolvedFilename = pg_snapshot_filename_or_default(filename);
         FILE* fp;
@@ -1108,19 +1283,21 @@ extern "C" {
             rc = SCE_PLAYGO_ERROR_EPERM;
             goto done;
         }
-        fprintf(fp,
-            "PlayGo PRX stub\n"
-            "version=%s\n"
-            "status=ok\n"
-            "chunk_count=%u\n"
-            "scenario_count=%u\n",
-            kPlayGoStubVersion,
-            g_playgo.chunk_count,
-            g_playgo.scenario_count);
-        fclose(fp);
-        rc = SCE_OK;
+        {
+            int writeResult = fprintf(fp,
+                "PlayGo PRX stub\n"
+                "version=%s\n"
+                "status=ok\n"
+                "chunk_count=%u\n"
+                "scenario_count=%u\n",
+                kPlayGoStubVersion,
+                g_playgo.chunk_count,
+                g_playgo.scenario_count);
+            int closeResult = fclose(fp);
+            rc = (writeResult >= 0 && closeResult == 0) ? SCE_OK : SCE_PLAYGO_ERROR_EPERM;
+        }
     done:
-        pg_logf("scePlayGoSnapshot rc=%d handle=%d filename=%s chunk_count=%u scenario_count=%u", rc, handle, resolvedFilename, g_playgo.chunk_count, g_playgo.scenario_count);
+        pg_logf("scePlayGoSnapshot rc=%d handle=%d filename=%s chunk_count=%u scenario_count=%u", rc, handle, rc == SCE_OK ? resolvedFilename : "(unavailable)", g_playgo.chunk_count, g_playgo.scenario_count);
         return rc;
     }
 
@@ -1130,18 +1307,20 @@ extern "C" {
      * This implementation always reports 0, meaning no extra disc is needed.
      */
     PRX_INTERFACE int32_t scePlayGoGetRequiredDisc(ScePlayGoHandle handle, ScePlayGoOptionalChunkType type, const ScePlayGoOptionalChunk* option, uint32_t* outRequiredDisc) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         rc = pg_require_handle(handle);
         if (rc != SCE_OK) goto done;
         if (option == NULL || outRequiredDisc == NULL) { rc = SCE_PLAYGO_ERROR_BAD_POINTER; goto done; }
         if (!pg_valid_optional_type(type)) { rc = SCE_PLAYGO_ERROR_BAD_OPTIONAL_TYPE; goto done; }
-        rc = pg_validate_optional_language_mask(type, option);
+        rc = pg_validate_optional_mask(type, option);
         if (rc != SCE_OK) goto done;
         *outRequiredDisc = 0;
         rc = SCE_OK;
     done:
-        pg_logf("scePlayGoGetRequiredDisc rc=%d handle=%d type=%d requested=0x%016llx required_disc=%u", rc, handle, type, pg_optional_mask_value(option), (rc == SCE_OK && outRequiredDisc != NULL) ? *outRequiredDisc : 0u);
+        pg_logf("scePlayGoGetRequiredDisc rc=%d handle=%d type=%d requested=0x%016llx required_disc=%u", rc, handle, type, pg_optional_mask_value(rc, option), (rc == SCE_OK && outRequiredDisc != NULL) ? *outRequiredDisc : 0u);
         return rc;
     }
 
@@ -1150,6 +1329,8 @@ extern "C" {
      * The stub remembers the accepted speed globally so GetInstallSpeed returns the same value later.
      */
     PRX_INTERFACE int32_t scePlayGoSetInstallSpeed2(int32_t reservedMustBeZero, uint32_t speed) {
+        PlayGoGuard guard;
+        if (!guard.locked()) return SCE_PLAYGO_ERROR_FATAL;
         int32_t rc = pg_require_initialized();
         if (rc != SCE_OK) goto done;
         if (reservedMustBeZero != 0) { rc = SCE_PLAYGO_ERROR_INVALID_ARGUMENT; goto done; }
